@@ -45,7 +45,7 @@ jobs:
             --env STARSTACK_ADMIN_USER=ci --env STARSTACK_ADMIN_PASSWORD=temporary-ci-password \
             --env STARSTACK_SYNC_INTERVAL_MINUTES=0 starstack:ci
           trap 'docker logs starstack-ci; docker rm --force --volumes starstack-ci' EXIT
-          curl --fail --silent --show-error --location --retry-connrefused --retry 10 --retry-delay 1 \
+          curl --fail --silent --show-error --location --retry-all-errors --retry 10 --retry-delay 1 \
             http://127.0.0.1:18080/login --output "$RUNNER_TEMP/starstack-login.html"
           grep -q 'id="root"' "$RUNNER_TEMP/starstack-login.html"
           docker exec starstack-ci test -w /data
