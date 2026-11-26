@@ -58,11 +58,7 @@ fn incremental_projection_recovers_and_filters_before_ranking() -> Result<()> {
         }
         Reply::json(json!({"embeddings":embeddings}))
     });
-    let ollama = Ollama {
-        client: Client::builder().no_proxy().build()?,
-        url: format!("{}/api/embed", server.url),
-        model: DEFAULT_MODEL.into(),
-    };
+    let ollama = Engine::fixture(&server.url, DEFAULT_MODEL)?;
     let build = |db: &mut Db, rebuild| build_with(db, temp.path(), rebuild, &ollama, &|_| {});
     build(&mut db, false)?;
     build(&mut db, false)?;
@@ -200,11 +196,7 @@ fn switching_models_requires_rebuild_and_invalid_embeddings_preserve_index() -> 
         }
         Reply::json(json!({"model":model,"embeddings":vectors}))
     });
-    let mut ollama = Ollama {
-        client: Client::builder().no_proxy().build()?,
-        url: format!("{}/api/embed", server.url),
-        model: DEFAULT_MODEL.into(),
-    };
+    let mut ollama = Engine::fixture(&server.url, DEFAULT_MODEL)?;
     build_with(&mut db, temp.path(), false, &ollama, &|_| {})?;
     let current = generation(&mut db)?;
     let filter = Filter {
@@ -228,7 +220,7 @@ fn switching_models_requires_rebuild_and_invalid_embeddings_preserve_index() -> 
             .contains("--rebuild")
     );
     mode.store(0, Ordering::Relaxed);
-    ollama.model = "replacement".into();
+    ollama = Engine::fixture(&server.url, "replacement")?;
     assert!(
         build_with(&mut db, temp.path(), false, &ollama, &|_| {})
             .unwrap_err()
@@ -262,5 +254,280 @@ fn semantic_candidates_use_current_owners_list_members_before_ranking() -> Resul
         ..Filter::default()
     };
     assert_eq!(allowed_ids(&mut db, "primary", &filter)?, [1]);
+    Ok(())
+}
+
+#[test]
+fn chunked_index_ranks_readme_suffix_reuses_vectors_and_rejects_changed_settings() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut db = store::connect(home.path())?;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let received = calls.clone();
+    let server = Server::new(move |request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let inputs = body["input"].as_array().unwrap();
+        assert!(inputs.len() <= BATCH);
+        received.fetch_add(inputs.len(), Ordering::Relaxed);
+        let rows: Vec<_> = inputs
+            .iter()
+            .map(|x| {
+                if x.as_str().unwrap().contains("photographs") {
+                    [0.0, 1.0]
+                } else {
+                    [1.0, 0.0]
+                }
+            })
+            .collect();
+        Reply::json(json!({"embeddings":rows}))
+    });
+    let other_endpoint = "http://127.0.0.1:18281";
+    crate::ollama_settings::set_endpoints(&mut db, &[server.url.clone(), other_endpoint.into()])?;
+    crate::ollama_settings::set(&mut db, Some(&server.url), Some("fixture"))?;
+    set_backend(&mut db, "ollama")?;
+    let mut a = repo(1, 2025, "library", "Rust");
+    a.readme = "installation and quickstart ".repeat(170);
+    let mut b = a.clone();
+    b.id = 2;
+    b.full_name = "sample/photos".into();
+    b.readme.push_str("Find and deduplicate photographs.");
+    store::upsert(&mut db, &a)?;
+    store::upsert(&mut db, &b)?;
+    build(&mut db, false, &|_| {})?;
+    assert!(!needs_rebuild(&mut db)?);
+    let n = calls.load(Ordering::Relaxed);
+    assert!(n > 2);
+    assert_eq!(embeddings::table.count().get_result::<i64>(&mut db)?, 2);
+    build(&mut db, false, &|_| {})?;
+    assert_eq!(calls.load(Ordering::Relaxed), n);
+    let ranks = search(&mut db, "photographs", &Filter::default(), 2)?;
+    assert_eq!(ranks[0].id, b.id);
+    assert!(ranks[0].score > ranks[1].score);
+
+    let generation_before = generation(&mut db)?;
+    let writer = std::cell::RefCell::new(store::connect(home.path())?);
+    let err = build(&mut db, true, &|stage| {
+        if stage.starts_with("正在写入") {
+            crate::ollama_settings::set(&mut writer.borrow_mut(), Some(other_endpoint), None)
+                .unwrap();
+        }
+    })
+    .unwrap_err();
+    assert!(err.to_string().contains("已变化"));
+    assert_eq!(generation(&mut db)?, generation_before);
+    assert!(needs_rebuild(&mut db)?);
+    assert!(
+        search(&mut db, "photographs", &Filter::default(), 2)
+            .unwrap_err()
+            .to_string()
+            .contains("--rebuild")
+    );
+    crate::ollama_settings::set(&mut db, Some(&server.url), None)?;
+    assert!(!needs_rebuild(&mut db)?);
+    Ok(())
+}
+
+#[test]
+fn legacy_ollama_identity_matches_only_its_default_endpoint() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut db = store::connect(dir.path())?;
+    let legacy = Selection {
+        provider: Provider::Ollama {
+            url: DEFAULT_OLLAMA_URL.to_owned(),
+            model: "legacy-model".into(),
+        },
+        policy: crate::chunking::Policy::whole_document(),
+    };
+    store::set_meta(&mut db, "index_model", "legacy-model")?;
+    assert!(!legacy.mismatches(&mut db)?);
+    let remote = Selection {
+        provider: Provider::Ollama {
+            url: "https://models.example".into(),
+            model: "legacy-model".into(),
+        },
+        policy: crate::chunking::Policy::whole_document(),
+    };
+    assert!(remote.mismatches(&mut db)?);
+    Ok(())
+}
+
+#[test]
+fn changing_chunk_policy_during_inference_stops_the_next_batch_and_rejects_search_results()
+-> Result<()> {
+    fn save_policy(db: &mut Db, preset: &str) -> Result<()> {
+        crate::chunking::save(db, serde_json::from_value(json!({"preset":preset}))?)
+    }
+    let home = tempfile::tempdir()?;
+    let mut db = store::connect(home.path())?;
+    let home_path = home.path().to_owned();
+    let change = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let during_request = change.clone();
+    let count = Arc::new(AtomicUsize::new(0));
+    let sent = count.clone();
+    let server = Server::new(move |request| {
+        sent.fetch_add(1, Ordering::SeqCst);
+        if during_request.swap(false, Ordering::SeqCst) {
+            let mut writer = store::connect(&home_path).unwrap();
+            save_policy(&mut writer, "balanced").unwrap();
+        }
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        Reply::json(
+            json!({"embeddings": vec![[1.0, 0.0]; body["input"].as_array().unwrap().len()]}),
+        )
+    });
+    crate::ollama_settings::set_endpoints(&mut db, std::slice::from_ref(&server.url))?;
+    crate::ollama_settings::set(&mut db, Some(&server.url), Some("fixture"))?;
+    set_backend(&mut db, "ollama")?;
+    let mut long = repo(17, 2025, "fixture", "Rust");
+    long.readme = "0123456789".repeat(420);
+    store::upsert(&mut db, &long)?;
+    save_policy(&mut db, "short")?;
+    build(&mut db, false, &|_| {})?;
+    let original_generation = generation(&mut db)?;
+    let original_identity = store::meta(&mut db, "index_identity")?;
+    assert!(count.load(Ordering::SeqCst) >= 2);
+    count.store(0, Ordering::SeqCst);
+    change.store(true, Ordering::SeqCst);
+    let err = build(&mut db, true, &|_| {}).unwrap_err();
+    assert!(err.to_string().contains("已变化"));
+    assert_eq!(count.load(Ordering::SeqCst), 1);
+    assert_eq!(generation(&mut db)?, original_generation);
+    assert_eq!(store::meta(&mut db, "index_identity")?, original_identity);
+    assert!(needs_rebuild(&mut db)?);
+    assert!(
+        build(&mut db, false, &|_| {})
+            .unwrap_err()
+            .to_string()
+            .contains("--rebuild")
+    );
+    save_policy(&mut db, "short")?;
+    assert!(!needs_rebuild(&mut db)?);
+    change.store(true, Ordering::SeqCst);
+    assert!(
+        search(&mut db, "fixture", &Filter::default(), 1)
+            .unwrap_err()
+            .to_string()
+            .contains("已变化")
+    );
+    build(&mut db, true, &|_| {})?;
+    assert_ne!(store::meta(&mut db, "index_identity")?, original_identity);
+    assert_eq!(
+        search(&mut db, "fixture", &Filter::default(), 1)?[0].id,
+        long.id
+    );
+    Ok(())
+}
+
+#[test]
+fn existing_ollama_projection_and_raw_vector_survive_an_incremental_upgrade() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut db = store::connect(home.path())?;
+    let owner = store::owner(&mut db)?;
+    let historical_model = std::env::var("STARSTACK_MODEL")
+        .ok()
+        .filter(|m| !m.trim().is_empty())
+        .unwrap_or_else(|| "older-custom-embedding:v1".into());
+    let item = repo(19, 2025, "legacy repository", "Rust");
+    store::upsert(&mut db, &item)?;
+    let blob: Vec<_> = [3.0_f32, 4.0]
+        .into_iter()
+        .flat_map(f32::to_le_bytes)
+        .collect();
+    db.batch_execute(SCHEMA)?;
+    diesel::insert_into(embeddings::table)
+        .values((
+            embeddings::owner.eq(&owner),
+            embeddings::id.eq(item.id),
+            embeddings::fingerprint.eq(fingerprint(&historical_model, &document(&item))),
+            embeddings::vector.eq(&blob),
+            embeddings::checksum.eq(Sha256::digest(&blob).to_vec()),
+        ))
+        .execute(&mut db)?;
+    let mut identity = ProjectionIdentity::new(1);
+    identity.embedding_model = Some(historical_model.clone());
+    identity.embedding_version = Some(owner.clone());
+    let path = artifact_path(home.path(), &owner, 1);
+    let mut writer = ProjectionWriter::create(
+        &path,
+        ProjectionBuildConfig::new(2, identity)
+            .with_metric(ProjectionMetric::Cosine)
+            .with_bit_width(RaBitQBitWidth::Four),
+    )?;
+    writer.push(item.id as u64, &[3.0, 4.0])?;
+    writer.finish()?;
+    store::set_meta(&mut db, "index_generation", "1")?;
+    store::set_meta(&mut db, "index_dimension", "2")?;
+    store::set_meta(&mut db, "index_model", &historical_model)?;
+    let remote = "http://127.0.0.1:18281";
+    crate::ollama_settings::set_endpoints(&mut db, &[DEFAULT_OLLAMA_URL.into(), remote.into()])?;
+    crate::ollama_settings::set(&mut db, Some(DEFAULT_OLLAMA_URL), None)?;
+    assert_eq!(backend(&mut db)?, "ollama");
+    assert!(crate::chunking::selected(&mut db, "ollama")?.legacy());
+    assert!(!needs_rebuild(&mut db)?);
+    let initial_file = fs::read(&path)?;
+    assert!(build(&mut db, false, &|_| {})?.contains("索引已是最新"));
+    assert_eq!(generation(&mut db)?, 1);
+    assert_eq!(fs::read(path)?, initial_file);
+    assert_eq!(
+        embeddings::table
+            .find((&owner, item.id))
+            .select(embeddings::vector)
+            .first::<Vec<u8>>(&mut db)?,
+        blob
+    );
+
+    crate::ollama_settings::set(&mut db, Some(remote), None)?;
+    assert!(needs_rebuild(&mut db)?);
+    assert!(
+        search(&mut db, "fixture", &Filter::default(), 1)
+            .unwrap_err()
+            .to_string()
+            .contains("--rebuild")
+    );
+    Ok(())
+}
+
+#[test]
+fn selected_and_published_models_protect_only_the_referenced_artifacts() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut a = store::connect(home.path())?;
+    let mut b = store::connect_as(home.path(), "another-user")?;
+    let minilm = crate::models::DEFAULT_ID;
+    let qwen = crate::models::QWEN_ID;
+    store::set_meta(&mut a, "embedding_backend", "builtin")?;
+    assert!(ensure_model_unused(&mut b, minilm).is_err());
+    ensure_model_unused(&mut b, qwen)?;
+    store::set_meta(&mut a, "embedding_builtin_model", qwen)?;
+    ensure_model_unused(&mut b, minilm)?;
+    assert!(ensure_model_unused(&mut b, qwen).is_err());
+    store::set_meta(&mut a, "index_backend", "builtin")?;
+    store::set_meta(&mut a, "index_model", minilm)?;
+    assert!(ensure_model_unused(&mut b, minilm).is_err());
+    store::set_meta(&mut a, "embedding_backend", "ollama")?;
+    ensure_model_unused(&mut b, qwen)?;
+    Ok(())
+}
+
+#[test]
+fn repinned_model_keeps_its_name_and_invalidates_the_projection() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut db = store::connect(home.path())?;
+    let mut selection = Selection {
+        provider: Provider::Builtin {
+            id: crate::models::DEFAULT_ID.into(),
+            family: "minilm",
+            fingerprint: crate::models::descriptor(home.path(), crate::models::DEFAULT_ID)?
+                .fingerprint,
+        },
+        policy: crate::chunking::Policy::whole_document(),
+    };
+    assert_eq!(selection.identity(), crate::native_embedding::IDENTITY);
+    store::set_meta(&mut db, "index_identity", &selection.identity())?;
+    store::set_meta(&mut db, "index_backend", "builtin")?;
+    store::set_meta(&mut db, "index_model", crate::models::DEFAULT_ID)?;
+    assert!(!selection.mismatches(&mut db)?);
+    if let Provider::Builtin { fingerprint, .. } = &mut selection.provider {
+        *fingerprint = "different-tokenizer-checksum".into();
+    }
+    assert!(selection.mismatches(&mut db)?);
     Ok(())
 }

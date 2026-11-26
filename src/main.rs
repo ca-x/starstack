@@ -1,11 +1,20 @@
 //! StarStack CLI, web server and Model Context Protocol entry points.
 mod ai;
 mod auth;
+mod chat_settings;
+mod chunking;
 mod firecrawl;
 mod index;
 mod library;
 mod lists;
 mod mcp;
+mod model_hub;
+mod model_preferences;
+mod models;
+mod native_embedding;
+mod ollama_settings;
+mod organize;
+mod organizer;
 mod proxy;
 mod quota;
 mod store;
@@ -61,6 +70,11 @@ enum Command {
     Index {
         #[arg(long)]
         rebuild: bool,
+    },
+    /// 管理本机模型、下载来源与检索后端
+    Models {
+        #[command(subcommand)]
+        action: Option<ModelAction>,
     },
     /// 一句话召回收藏
     Search {
@@ -124,6 +138,32 @@ enum Command {
     },
     /// 启动 stdio MCP 工具
     Mcp,
+}
+#[derive(Subcommand)]
+enum ModelAction {
+    /// 列出内置模型和当前账号的选择
+    List,
+    /// 下载并校验内置模型（支持重复执行或切换来源）
+    Download {
+        #[arg(default_value = models::DEFAULT_ID)]
+        id: String,
+        #[arg(long, default_value = "huggingface", value_parser = ["huggingface", "modelscope"])]
+        source: String,
+    },
+    /// 选择 builtin 或 ollama；远程地址须由管理员加入允许列表
+    Select {
+        #[arg(value_parser = ["builtin", "ollama"])]
+        backend: String,
+        #[arg(long)]
+        model: Option<String>,
+        #[arg(long)]
+        url: Option<String>,
+    },
+    /// 移除不再使用的内置模型
+    Remove {
+        #[arg(default_value = models::DEFAULT_ID)]
+        id: String,
+    },
 }
 #[derive(Subcommand)]
 enum Auth {
@@ -223,6 +263,38 @@ fn run() -> Result<()> {
             ensure!(report.index_ready, "请按提示运行 starstack index");
         }
         Command::Index { rebuild } => println!("{}", index::build(&mut db, rebuild, &progress)?),
+        Command::Models { action } => match action.unwrap_or(ModelAction::List) {
+            ModelAction::List => println!(
+                "{}",
+                serde_json::to_string_pretty(&model_preferences::panel(&mut db)?)?
+            ),
+            ModelAction::Download { id, source } => {
+                models::install(&mut db, &id, &source, &progress)?;
+                println!("模型已准备就绪：{id}");
+            }
+            ModelAction::Remove { id } => {
+                models::remove(&mut db, &id)?;
+                println!("模型已移除：{id}");
+            }
+            ModelAction::Select {
+                backend,
+                model,
+                url,
+            } => {
+                model_preferences::select(
+                    &mut db,
+                    model_preferences::Selection {
+                        backend,
+                        model,
+                        url,
+                    },
+                )?;
+                println!("设置已保存");
+                if index::needs_rebuild(&mut db)? {
+                    println!("请运行 starstack index --rebuild");
+                }
+            }
+        },
         Command::Search {
             query,
             filter,

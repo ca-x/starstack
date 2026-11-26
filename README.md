@@ -15,10 +15,10 @@
    cargo build --release --locked
    ```
 
-2. **准备本机 embedding。** 启动 Ollama 服务后拉取多语言模型。只有需要在软件内生成 AI 推荐时，才需额外拉取聊天模型 `ollama pull qwen3:4b`。
+2. **下载检索模型。** 新资料库默认使用 Multilingual MiniLM-L12-v2，在本机 CPU 上计算向量。首次使用从 Hugging Face 下载约 458 MiB 的模型文件。使用 ModelScope 时，把下面的 `huggingface` 换成 `modelscope`。
 
    ```bash
-   ollama pull qwen3-embedding:0.6b
+   starstack models download --source huggingface
    ```
 
 3. **连接自己的 GitHub。** 本机已登录 GitHub CLI 时，运行 **`starstack auth login --gh`** 即可。星栈仅记录凭证来源，在同步时向本机 `gh` 读取当前账号的凭证。已有个人 token 也可设 `GITHUB_TOKEN`。使用设备码时，设置你自己的 GitHub OAuth App 的 Client ID，然后在浏览器输入星栈显示的短码。如果服务器需要代理，可先设置环境变量 `STARSTACK_PROXY_URL`，支持 HTTP 和 SOCKS5；输入短码可使用另一台能访问 GitHub 的设备。访问公开收藏可保持默认的空 scope。App 注册和 Compose 参数见[设备授权设置](docs/deploy.md)。
@@ -48,6 +48,29 @@ starstack serve
 
 管理员可以创建账号、启停用户、设置角色和重置密码。每个账号拥有自己的收藏、批注、GitHub 授权、定时配置和 MCP token。管理员的初始库与本机 CLI 共用；其他用户通过 Web 或带个人 token 的 HTTP MCP 访问自己的收藏。密码或角色变更后重新登录，并为助手签发新 token。
 
+### 选择内置或远端检索模型
+
+在「同步与索引」的「语义索引」中，管理员可以选择来源、查看下载进度和管理各账号共用的模型文件。如果选择 Ollama，管理员先添加可用的服务地址，各账号再选择地址并填写该服务已安装的模型名。该服务会收到用于索引的仓库文本、私人批注和搜索时的查询。内置模型在本机处理这些内容。
+
+**内置模型。** 首次索引或查询需要计算向量时，星栈才将已下载的权重加载到当前进程。以下命令使用 ModelScope 配置本机初始库。
+
+```bash
+starstack models download --source modelscope
+starstack models select builtin
+starstack index --rebuild
+```
+
+**远端 Ollama。** 先在 Ollama 服务器上运行 `ollama pull qwen3-embedding:0.6b`。管理员将该服务加入「管理 Ollama 服务地址」后，在运行星栈的机器上执行以下命令，并将示例地址替换为已添加的地址。
+
+```bash
+starstack models select ollama --url http://ollama.example.org:11434 --model qwen3-embedding:0.6b
+starstack index --rebuild
+```
+
+内置目录还提供原生 Qwen3-Embedding-0.6B Q4_K_M，下载约 387 MiB。运行 `starstack models download qwen3-embedding-0.6b-q4-k-m --source modelscope`，再运行 `starstack models select builtin --model qwen3-embedding-0.6b-q4-k-m` 即可选用。管理员也可搜索模型库或上传离线文件。两款预设会核对固定 SHA-256，自定义模型支持单文件 safetensors 权重、384 维均值池化的 Sentence Transformers BERT 模型。
+
+在「分块预设」中，每个账号可为当前后端选择均衡、短分块、长分块或整篇。新库默认均衡，每块 512 个字符，相邻块重叠 64 个字符。原有 Ollama 索引沿用整篇。更改检索模型或分块设置后，在该账号下选择「重建索引」。部署者可为任一下载源配置镜像。[模型下载、镜像与索引设置](docs/deploy.md#检索模型与分块)
+
 ## GitHub 收藏分类
 
 在 GitHub Stars 中手工创建的 Lists 通过 GraphQL 同步，保留分类名称和成员关系。先运行 `starstack lists --refresh` 查看自己的分类，再按名称筛选。私人标签由星栈保存在本地，同一仓库可以同时属于多个 GitHub 分类并带有私人标签。[GitHub Stars 与 Lists](https://docs.github.com/en/get-started/exploring-projects-on-github/saving-repositories-with-stars)
@@ -61,6 +84,18 @@ starstack search '命令行模糊搜索' --list "Dev tools"
 将 `Dev tools` 替换成已有分类名。分类总览显示 GitHub 返回的成员数，筛选结果只包含当前账号仍在收藏目录中的仓库。MCP 工具 `search_stars` 接受相同含义的 JSON 参数，例如 `{"query":"命令行模糊搜索","list":"Dev tools"}`。
 
 ## 整理与导出
+
+在「收藏统计」的「本地标签云」中点击标签，即可查看对应仓库。在收藏库中打开「AI 整理」，可以逐批预览建议，也可以确认让后台自动整理当前筛选范围。目标可选本地私人标签或已有的 GitHub 收藏分类，写入 GitHub 需有相应权限。按标签筛选时，应用更改后重新查询以刷新匹配结果。
+
+AI 整理和 AI 推荐共用单独的聊天模型。首次使用前，管理员在后台配置 Aimux，或显式设置下列环境变量。以 Ollama 为例，先在聊天服务器运行 `ollama pull qwen3:4b`。将示例地址换成 StarStack 能访问的服务器。
+
+```bash
+export STARSTACK_AI_PROVIDER=ollama
+export STARSTACK_AI_BASE_URL=http://ollama.example.org:11434/v1
+export STARSTACK_AI_MODEL=qwen3:4b
+```
+
+配置后重新启动 StarStack。整理请求向所选聊天服务发送仓库名称、简介、语言、主题及已有标签和分类名。配置聊天服务之前也可以使用语义检索。
 
 ```bash
 starstack list --sort stars --language Rust --archived false
@@ -77,7 +112,7 @@ starstack export --format json --output stars.json
 
 ## AI 与 MCP
 
-- **在星栈内询问**。选择「AI 推荐」，或运行 `starstack ask '帮我从收藏里挑个 CLI 库'`。Aimux 默认调用本机 Ollama。切换到远端服务时，问题和最多五个候选仓库的名称、描述及语言会发送给那个 provider，回答中的编号对应返回的仓库链接。[模型配置](docs/deploy.md)
+- **在星栈内询问**。选择「AI 推荐」，或运行 `starstack ask '帮我从收藏里挑个 CLI 库'`。通过 Aimux 配置聊天服务后，问题和最多五个候选仓库的名称、描述及语言会发送给那个 provider，回答中的编号对应返回的仓库链接。[模型配置](docs/deploy.md)
 - **在 AI 助手里询问**。Claude Desktop 可通过 stdio 启动星栈。多用户服务提供 `/mcp`，支持在后台签发、撤销按用户隔离的 Bearer token。助手申请同步后，由用户在星栈中确认。[接入步骤](docs/mcp.md) · [Claude Desktop 示例](examples/claude_desktop_config.json)
 
 ## 同步和恢复
@@ -88,12 +123,12 @@ starstack export --format json --output stars.json
 | 日常新增 | `starstack sync` 从最近收藏开始增量拉取，同一时间戳的记录一起核对。 |
 | 旧仓库改名、说明更新、unstar | `starstack sync --full` 或后台定时任务完整核对。取消收藏后从列表和检索中移除；重新 star 会找回本地批注。 |
 | 定时刷新 | 仅在 Web 服务运行时执行。默认每 360 分钟全量核对目录。后台 README 任务默认每 30 分钟消费一批待处理仓库，再更新变化的向量。两个周期均可按用户调整，设为 0 可关闭对应任务。 |
-| 换模型或索引受损 | 设置 `STARSTACK_MODEL` 并拉取对应模型，运行 `starstack index --rebuild`。批注保存在 SQLite。 |
+| 更换检索模型、分块设置或索引受损 | 在「语义索引」选择「重建索引」。本机初始库也可运行 `starstack index --rebuild`。批注保存在 SQLite。 |
 | GitHub 限流或 token 失效 | 星栈按账户分别记录 REST 和 GraphQL 响应中的额度窗口。默认预留 5% 配额，每轮 README 最多 200 次请求。若触及预留值，目录仍可使用剩余额度；耗尽或收到限流后遵守重置时间。目录分页不完整时保留原有成员和游标。 |
-| Ollama 未启动 | 同步的元数据已保存。启动 Ollama，确认模型已下载，然后运行 `starstack index`。 |
+| 检索模型未就绪 | 同步的元数据已保存。内置模型可重新下载或切换下载源，使用 Ollama 的账号则需确认服务在线、模型已安装，再运行索引。 |
 | 搬家、备份 | 停止服务及其他写入进程，备份整个 `STARSTACK_HOME`。其中包括设备授权凭证，请保护备份。 |
 
-README 抓取失败时，已入库的目录、上一版 README 和私人批注仍可用，待处理队列下轮继续。CLI 的 `sync` 会在前台完成一批；Web 服务可异步补全。在「同步与索引」中可按用户调整预算与预留比例。需要用本机 Firecrawl 解析公开项目页面时，使用 `cargo build --release --locked --features firecrawl-local` 构建，或运行 `STARSTACK_FEATURES=firecrawl-local docker compose up -d --build`。官方发布流程使用基础构建。可选的 `firecrawl-local` crate 使用 AGPL-3.0 许可。[部署与抓取方式](docs/deploy.md) · [Firecrawl Local](https://crates.io/crates/firecrawl-local/0.1.1)
+README 抓取失败时，已入库的目录、上一版 README 和私人批注仍可用，待处理队列下轮继续。CLI 的 `sync` 会在前台完成一批；Web 服务可异步补全。在「同步与索引」中可按用户调整预算与预留比例。发行版内置 Firecrawl Local。每个账号可选 GitHub API 或 Firecrawl Local 抓取 README。Firecrawl Local 在本机解析公开仓库页面，私有仓库和可见性未知的仓库使用 GitHub REST。Firecrawl Local 使用 AGPL-3.0 许可。[部署与抓取方式](docs/deploy.md) · [Firecrawl Local](https://crates.io/crates/firecrawl-local/0.1.1)
 
 数据库使用 Diesel ORM 与 SQLite。用户 ID 和 GitHub 稳定仓库 ID 一起标识收藏，向量缓存的指纹覆盖模型和语义内容。HawDB 投影按代发布，库内保存当前代号；搜索先限制到当前用户和筛选条件，再做向量排序。[部署与存储位置](docs/deploy.md)
 

@@ -11,7 +11,7 @@ ARG STARSTACK_FEATURES=""
 WORKDIR /src
 COPY . .
 COPY --from=web /src/web/dist ./web/dist
-RUN if [ -n "$STARSTACK_FEATURES" ]; then apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*; fi
+RUN apt-get update && apt-get install -y --no-install-recommends cmake && rm -rf /var/lib/apt/lists/*
 RUN cargo build --release --locked --bin starstack --features "$STARSTACK_FEATURES"
 
 FROM debian:bookworm-slim
@@ -20,6 +20,7 @@ RUN apt-get update \
     && rm -rf /var/lib/apt/lists/* \
     && install -d -m 0750 -o 10001 -g 10001 /data
 COPY --from=build /src/target/release/starstack /usr/local/bin/starstack
+COPY docs/licenses/Firecrawl-AGPL-3.0.txt /usr/share/doc/starstack/Firecrawl-AGPL-3.0.txt
 ENV STARSTACK_HOME=/data
 USER 10001:10001
 VOLUME ["/data"]

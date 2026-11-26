@@ -1,4 +1,7 @@
-//! Local Ollama embeddings with an immutable, filtered HawDB cosine projection.
+//! Built-in Candle and Ollama embeddings with an immutable, filtered HawDB cosine projection.
+pub(crate) mod mean;
+
+use std::cell::OnceCell;
 use std::collections::BTreeMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -28,23 +31,217 @@ diesel::table! {
     }
 }
 
+#[cfg(test)]
 const DEFAULT_MODEL: &str = "qwen3-embedding:0.6b";
+const DEFAULT_OLLAMA_URL: &str = "http://127.0.0.1:11434";
 const BATCH: usize = 16;
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS embeddings (
     owner TEXT NOT NULL, id INTEGER NOT NULL, fingerprint BLOB NOT NULL, vector BLOB NOT NULL, checksum BLOB NOT NULL, PRIMARY KEY(owner,id)
 )";
 
-pub(crate) fn model() -> String {
-    std::env::var("STARSTACK_MODEL")
-        .ok()
-        .filter(|s| !s.trim().is_empty())
-        .unwrap_or_else(|| DEFAULT_MODEL.to_owned())
+pub(crate) fn backend(db: &mut Db) -> Result<String> {
+    if let Some(explicit) = store::meta(db, "embedding_backend")? {
+        ensure!(
+            matches!(explicit.as_str(), "builtin" | "ollama"),
+            "无效的嵌入后端，请重新选择模型"
+        );
+        return Ok(explicit);
+    }
+    if crate::ollama_settings::inherited() {
+        return Ok("ollama".into());
+    }
+    if let Some(saved) = store::meta(db, "index_backend")? {
+        return Ok(saved);
+    }
+    Ok(if store::meta(db, "index_model")?.is_some() {
+        "ollama"
+    } else {
+        "builtin"
+    }
+    .into())
 }
 
-struct Ollama {
-    client: Client,
-    url: String,
-    model: String,
+pub(crate) fn set_backend(db: &mut Db, name: &str) -> Result<()> {
+    match name {
+        "builtin" => {
+            let model = builtin_id(db)?;
+            set_builtin(db, &model)
+        }
+        "ollama" => {
+            crate::ollama_settings::selected(db)?;
+            store::set_meta(db, "embedding_backend", "ollama")
+        }
+        _ => anyhow::bail!("请选择 builtin 或 ollama 后端"),
+    }
+}
+
+fn builtin_id(db: &mut Db) -> Result<String> {
+    Ok(store::meta(db, "embedding_builtin_model")?
+        .unwrap_or_else(|| crate::models::DEFAULT_ID.to_owned()))
+}
+
+pub(crate) fn set_builtin(db: &mut Db, id: &str) -> Result<()> {
+    let home = store::data_dir(db)?;
+    let _lease = crate::models::open_installed(&home, id)?;
+    crate::models::descriptor(&home, id)?;
+    db.immediate_transaction(|db| {
+        store::set_meta(db, "embedding_builtin_model", id)?;
+        store::set_meta(db, "embedding_backend", "builtin")
+    })
+}
+
+pub(crate) fn ensure_model_unused(db: &mut Db, id: &str) -> Result<()> {
+    use diesel::sql_types::{Bool, Text};
+    #[derive(QueryableByName)]
+    struct Used {
+        #[diesel(sql_type = Bool)]
+        used: bool,
+    }
+    // Older built-in choices stored only their backend. Their implicit model is MiniLM.
+    let used=diesel::sql_query("SELECT EXISTS (
+      SELECT 1 FROM metadata_values b LEFT JOIN metadata_values m
+        ON m.owner_id=b.owner_id AND m.key=CASE b.key WHEN 'embedding_backend' THEN 'embedding_builtin_model' ELSE 'index_model' END
+      WHERE b.key IN ('embedding_backend','index_backend') AND b.value='builtin' AND COALESCE(m.value,?)=?
+    ) AS used").bind::<Text,_>(crate::models::DEFAULT_ID).bind::<Text,_>(id).get_result::<Used>(db)?.used;
+    ensure!(
+        !used,
+        "此内置模型仍被资料库选择或索引使用，请先切换模型并重建相关索引"
+    );
+    Ok(())
+}
+
+#[derive(PartialEq, Eq)]
+enum Provider {
+    Builtin {
+        id: String,
+        family: &'static str,
+        fingerprint: String,
+    },
+    Ollama {
+        url: String,
+        model: String,
+    },
+}
+
+impl Provider {
+    fn selected(db: &mut Db) -> Result<Self> {
+        match backend(db)?.as_str() {
+            "builtin" => {
+                let id = builtin_id(db)?;
+                let crate::models::Descriptor {
+                    family,
+                    fingerprint,
+                } = crate::models::descriptor(&store::data_dir(db)?, &id)?;
+                Ok(Self::Builtin {
+                    id,
+                    family,
+                    fingerprint,
+                })
+            }
+            "ollama" => {
+                let (url, model) = crate::ollama_settings::selected(db)?;
+                Ok(Self::Ollama { url, model })
+            }
+            _ => anyhow::bail!("不支持的嵌入后端"),
+        }
+    }
+    fn name(&self) -> &str {
+        match self {
+            Self::Builtin { .. } => "builtin",
+            Self::Ollama { .. } => "ollama",
+        }
+    }
+    fn model(&self) -> &str {
+        match self {
+            Self::Builtin { id, .. } => id,
+            Self::Ollama { model, .. } => model,
+        }
+    }
+}
+
+pub(crate) fn configured_model(db: &mut Db) -> Result<String> {
+    Ok(Provider::selected(db)?.model().to_owned())
+}
+
+#[derive(PartialEq, Eq)]
+struct Selection {
+    provider: Provider,
+    policy: crate::chunking::Policy,
+}
+
+impl Selection {
+    fn read(db: &mut Db) -> Result<Self> {
+        let provider = Provider::selected(db)?;
+        let policy = crate::chunking::selected(db, provider.name())?;
+        Ok(Self { provider, policy })
+    }
+
+    fn identity(&self) -> String {
+        let base = match &self.provider {
+            // Preserve the first MiniLM index format only for the exact original
+            // config, tokenizer and weights. A repinned package must get a new key.
+            Provider::Builtin {
+                id, fingerprint, ..
+            } if id == crate::models::DEFAULT_ID
+                && fingerprint
+                    == "253df9140f5abfa7533637cc3718ac079a2ad3f30dbe5f8728a3717761570ff5" =>
+            {
+                crate::native_embedding::IDENTITY.to_owned()
+            }
+            Provider::Builtin {
+                id,
+                family,
+                fingerprint,
+            } => {
+                let protocol = if *family == "qwen3-gguf" {
+                    crate::native_embedding::QWEN_PROTOCOL
+                } else {
+                    "masked-mean-128-stride24-v2"
+                };
+                format!("builtin:{id}:{fingerprint}:{protocol}")
+            }
+            // Old indexes only recorded the model name for the default Ollama endpoint.
+            Provider::Ollama { url, model } if url == DEFAULT_OLLAMA_URL => model.clone(),
+            Provider::Ollama { url, model } => {
+                format!("ollama:{model}@{:x}", Sha256::digest(url.as_bytes()))
+            }
+        };
+        if self.policy.legacy() {
+            base
+        } else {
+            format!("{base}|{}", self.policy.identity())
+        }
+    }
+
+    fn mismatches(&self, db: &mut Db) -> Result<bool> {
+        let Some(model) = store::meta(db, "index_model")? else {
+            return Ok(false);
+        };
+        if model != self.provider.model() {
+            return Ok(true);
+        }
+        let identity = store::meta(db, "index_identity")?.unwrap_or(model);
+        let backend = store::meta(db, "index_backend")?.unwrap_or_else(|| "ollama".into());
+        Ok(identity != self.identity() || backend != self.provider.name())
+    }
+}
+
+pub(crate) fn needs_rebuild(db: &mut Db) -> Result<bool> {
+    db.transaction(|db| Selection::read(db)?.mismatches(db))
+}
+
+enum Runtime {
+    Ollama(Client),
+    Builtin {
+        home: PathBuf,
+        files: OnceCell<crate::models::ModelFiles>,
+    },
+}
+
+struct Engine {
+    selection: Selection,
+    runtime: Runtime,
+    managed: bool,
 }
 
 #[derive(Deserialize)]
@@ -53,68 +250,125 @@ struct Embeddings {
     embeddings: Vec<Vec<f32>>,
 }
 
-impl Ollama {
-    fn configured() -> Result<Self> {
-        let url = std::env::var("STARSTACK_OLLAMA_URL")
-            .unwrap_or_else(|_| "http://127.0.0.1:11434".to_owned());
+impl Engine {
+    fn configured(db: &mut Db) -> Result<Self> {
+        let selection = db.transaction(Selection::read)?;
+        let runtime = match &selection.provider {
+            Provider::Builtin { .. } => Runtime::Builtin {
+                home: store::data_dir(db)?,
+                files: OnceCell::new(),
+            },
+            Provider::Ollama { .. } => Runtime::Ollama(
+                Client::builder()
+                    .no_proxy()
+                    .redirect(reqwest::redirect::Policy::none())
+                    .connect_timeout(Duration::from_secs(5))
+                    .timeout(Duration::from_secs(180))
+                    .build()?,
+            ),
+        };
         Ok(Self {
-            client: Client::builder()
-                .no_proxy()
-                .redirect(reqwest::redirect::Policy::none())
-                .connect_timeout(Duration::from_secs(5))
-                .timeout(Duration::from_secs(180))
-                .build()?,
-            url: format!("{}/api/embed", url.trim_end_matches('/')),
-            model: model(),
+            selection,
+            runtime,
+            managed: true,
         })
     }
 
-    fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
-        let response = self
-            .client
-            .post(&self.url)
-            .json(&serde_json::json!({"model": self.model, "input": texts}))
-            .send()
-            .with_context(|| {
-                format!(
-                    "无法连接 Ollama（{}），请确认服务正在运行且地址可达",
-                    self.url
-                )
-            })?;
-        ensure!(
-            response.status().is_success(),
-            "Ollama 返回 {}。请确认模型 {} 可用，必要时运行 ollama pull {}",
-            response.status(),
-            self.model,
-            self.model
-        );
-        let payload = response
-            .json::<Embeddings>()
-            .context("读取 Ollama /api/embed 响应失败")?;
-        if let Some(returned) = payload.model {
+    // Keep the shared filesystem lease through publication or the last result check.
+    fn acquire(&self) -> Result<()> {
+        if let Runtime::Builtin { home, files } = &self.runtime
+            && files.get().is_none()
+        {
+            let installed = crate::models::open_installed(home, self.selection.provider.model())?;
+            let _ = files.set(installed);
+        }
+        Ok(())
+    }
+
+    fn check_current(&self, db: &mut Db) -> Result<()> {
+        if self.managed {
             ensure!(
-                returned == self.model
-                    || returned.strip_suffix(":latest") == Some(self.model.as_str())
-                    || self.model.strip_suffix(":latest") == Some(returned.as_str()),
-                "请求的嵌入模型为 {}，Ollama 响应模型为 {returned}，请检查服务配置",
-                self.model
+                Selection::read(db)? == self.selection,
+                "嵌入后端、服务地址、模型或分块配置已变化，请重新执行"
             );
         }
-        let vectors = payload.embeddings;
-        ensure!(
-            vectors.len() == texts.len(),
-            "Ollama 返回 {} 个向量，预期与 {} 段文本逐一对应",
-            vectors.len(),
-            texts.len()
-        );
-        ensure!(
-            vectors.iter().all(|v| valid(v)),
-            "Ollama 返回了空向量、全零向量或非有限值，请检查模型"
-        );
-        Ok(vectors)
+        Ok(())
+    }
+
+    #[cfg(test)]
+    fn fixture(url: &str, model: &str) -> Result<Self> {
+        Ok(Self {
+            selection: Selection {
+                provider: Provider::Ollama {
+                    model: model.to_owned(),
+                    url: url.to_owned(),
+                },
+                policy: crate::chunking::Policy::whole_document(),
+            },
+            runtime: Runtime::Ollama(Client::builder().no_proxy().build()?),
+            managed: false,
+        })
+    }
+
+    fn embed(&self, db: &mut Db, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+        // Re-check before sending each batch. A settings change during one request
+        // must stop later batches from sending repository text to the former server.
+        db.transaction(|db| self.check_current(db))?;
+        self.acquire()?;
+        match (&self.runtime, &self.selection.provider) {
+            (Runtime::Builtin { files, .. }, Provider::Builtin { family, .. }) => {
+                crate::native_embedding::embed(
+                    files.get().context("内置模型不可用")?.path(),
+                    family,
+                    texts,
+                )
+            }
+            (Runtime::Ollama(client), Provider::Ollama { url, model }) => {
+                ollama_embed(client, url, model, texts)
+            }
+            _ => anyhow::bail!("嵌入配置不一致"),
+        }
     }
 }
 
+fn ollama_embed(client: &Client, url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    let response = client
+        .post(format!("{url}/api/embed"))
+        .json(&serde_json::json!({"model": model, "input": texts}))
+        .send()
+        .with_context(|| format!("无法连接 Ollama（{}），请确认服务正在运行且地址可达", url))?;
+    ensure!(
+        response.status().is_success(),
+        "Ollama 返回 {}。请确认模型 {} 可用，必要时运行 ollama pull {}",
+        response.status(),
+        model,
+        model
+    );
+    let payload = response
+        .json::<Embeddings>()
+        .context("读取 Ollama /api/embed 响应失败")?;
+    if let Some(returned) = payload.model {
+        ensure!(
+            returned == model
+                || returned.strip_suffix(":latest") == Some(model)
+                || model.strip_suffix(":latest") == Some(returned.as_str()),
+            "请求的嵌入模型为 {}，Ollama 响应模型为 {returned}，请检查服务配置",
+            model
+        );
+    }
+    let vectors = payload.embeddings;
+    ensure!(
+        vectors.len() == texts.len(),
+        "Ollama 返回 {} 个向量，预期与 {} 段文本逐一对应",
+        vectors.len(),
+        texts.len()
+    );
+    ensure!(
+        vectors.iter().all(|v| valid(v)),
+        "Ollama 返回了空向量、全零向量或非有限值，请检查模型"
+    );
+    Ok(vectors)
+}
 fn valid(vector: &[f32]) -> bool {
     !vector.is_empty() && vector.iter().any(|v| *v != 0.0) && vector.iter().all(|v| v.is_finite())
 }
@@ -163,13 +417,11 @@ fn build_generation(conn: &mut Db, rebuild: bool) -> Result<u64> {
     }
 }
 
-fn check_model(db: &mut Db, selected: &str, rebuild: bool) -> Result<()> {
-    if !rebuild && let Some(saved) = store::meta(db, "index_model")? {
-        ensure!(
-            saved == selected,
-            "现有索引使用 {saved}，当前配置使用 {selected}。请切回旧模型，或运行 starstack index --rebuild 切换模型"
-        );
-    }
+fn check_model(db: &mut Db, selection: &Selection, rebuild: bool) -> Result<()> {
+    ensure!(
+        rebuild || !selection.mismatches(db)?,
+        "后端、模型、服务地址或分块配置与现有索引不同，请运行 starstack index --rebuild"
+    );
     Ok(())
 }
 
@@ -192,21 +444,20 @@ fn open_projection(
 
 struct Document {
     id: i64,
-    text: String,
     hash: Vec<u8>,
 }
 
 fn documents(conn: &mut Db, model: &str) -> Result<Vec<Document>> {
     let mut docs = Vec::new();
-    for repo in store::repos(conn)? {
+    store::visit_repos(conn, |repo| {
         ensure!(repo.id >= 0, "invalid repository id {}", repo.id);
         let text = document(&repo);
         docs.push(Document {
             id: repo.id,
             hash: fingerprint(model, &text),
-            text,
         });
-    }
+        Ok(())
+    })?;
     docs.sort_unstable_by_key(|doc| doc.id);
     Ok(docs)
 }
@@ -252,38 +503,37 @@ fn cached_vectors(
 }
 
 pub(crate) fn build(conn: &mut Db, rebuild: bool, progress: &dyn Fn(&str)) -> Result<String> {
-    let ollama = Ollama::configured()?;
+    let engine = Engine::configured(conn)?;
+    engine.acquire()?;
     let dir = store::data_dir(conn)?;
-    build_with(conn, &dir, rebuild, &ollama, progress)
+    build_with(conn, &dir, rebuild, &engine, progress)
 }
 
 fn build_with(
     conn: &mut Db,
     dir: &Path,
     rebuild: bool,
-    ollama: &Ollama,
+    engine: &Engine,
     progress: &dyn Fn(&str),
 ) -> Result<String> {
+    let key = engine.selection.identity();
     let owner = store::owner(conn)?;
     let (current, revision, docs, mut vectors, existing_count) = conn
         .transaction::<_, anyhow::Error, _>(|db| {
+            engine.check_current(db)?;
             let current = build_generation(db, rebuild)?;
-            check_model(db, &ollama.model, rebuild)?;
-            let docs = documents(db, &ollama.model)?;
+            check_model(db, &engine.selection, rebuild)?;
+            let docs = documents(db, &key)?;
             let vectors = if rebuild || current == 0 {
                 BTreeMap::new()
             } else {
                 cached_vectors(db, &owner, &docs)
                     .context("无法读取嵌入缓存，请运行 starstack index --rebuild")?
             };
-            let existing_count = open_projection(
-                &artifact_path(dir, &owner, current),
-                current,
-                &owner,
-                &ollama.model,
-            )
-            .ok()
-            .map(|p| p.manifest().document_count);
+            let existing_count =
+                open_projection(&artifact_path(dir, &owner, current), current, &owner, &key)
+                    .ok()
+                    .map(|p| p.manifest().document_count);
             Ok((
                 current,
                 library_revision(db)?,
@@ -298,6 +548,7 @@ fn build_with(
         .collect();
     if !rebuild && missing.is_empty() && existing_count == Some(docs.len()) {
         conn.immediate_transaction::<_, anyhow::Error, _>(|db| {
+            engine.check_current(db)?;
             ensure!(
                 build_generation(db, rebuild)? == current && library_revision(db)? == revision,
                 "收藏资料已更新，请重试 starstack index"
@@ -307,16 +558,36 @@ fn build_with(
         return Ok(format!("索引已是最新，共 {} 个仓库", docs.len()));
     }
 
-    for (i, chunk) in missing.chunks(BATCH).enumerate() {
+    for (i, group) in missing.chunks(BATCH).enumerate() {
         progress(&format!(
             "正在为仓库计算向量（第 {}–{} 个，共 {} 个）",
             i * BATCH + 1,
-            i * BATCH + chunk.len(),
+            i * BATCH + group.len(),
             missing.len()
         ));
-        let texts: Vec<_> = chunk.iter().map(|d| d.text.as_str()).collect();
-        for (doc, vector) in chunk.iter().zip(ollama.embed(&texts)?) {
-            vectors.insert(doc.id, vector);
+        // Read README bodies for the changed IDs a group at a time, outside the
+        // transaction during inference. Recheck fingerprints and revision before publishing.
+        let mut means: Vec<_> = (0..group.len()).map(|_| mean::Mean::default()).collect();
+        let mut batch = Vec::with_capacity(BATCH);
+        for (idx, doc) in group.iter().enumerate() {
+            let text = document(&store::by_id(conn, doc.id)?);
+            ensure!(
+                fingerprint(&key, &text) == doc.hash,
+                "建索引期间收藏资料已更新，请重试 starstack index"
+            );
+            for fragment in engine.selection.policy.split(&text) {
+                batch.push((idx, fragment));
+                if batch.len() == BATCH {
+                    embed_fragments(conn, engine, &batch, &mut means)?;
+                    batch.clear();
+                }
+            }
+        }
+        if !batch.is_empty() {
+            embed_fragments(conn, engine, &batch, &mut means)?;
+        }
+        for (doc, mean) in group.iter().zip(means) {
+            vectors.insert(doc.id, mean.finish()?);
         }
     }
 
@@ -329,7 +600,7 @@ fn build_with(
     let staged = stage.path().join("projection.hawdb");
     progress(&format!("正在写入 {} 个仓库的 HawDB 索引", docs.len()));
     let mut identity = ProjectionIdentity::new(next);
-    identity.embedding_model = Some(ollama.model.clone());
+    identity.embedding_model = Some(key.clone());
     identity.embedding_version = Some(owner.clone());
     let dimension = vectors.values().next().map_or(1, Vec::len);
     if !rebuild
@@ -356,6 +627,7 @@ fn build_with(
     // Publish into the inactive slot before committing its generation in SQLite. A failed
     // write or crash leaves the previously committed projection and its matching cache intact.
     conn.immediate_transaction(|db| {
+        engine.check_current(db)?;
         ensure!(
             build_generation(db, rebuild)? == current,
             "另一个进程已更新索引，请重试 starstack index"
@@ -398,7 +670,14 @@ fn build_with(
                 .execute(db)?;
         }
         store::set_meta(db, "index_generation", &next.to_string())?;
-        store::set_meta(db, "index_model", &ollama.model)?;
+        store::set_meta(db, "index_model", engine.selection.provider.model())?;
+        store::set_meta(db, "index_backend", engine.selection.provider.name())?;
+        store::set_meta(db, "index_identity", &key)?;
+        store::set_meta(
+            db,
+            "index_chunk_policy",
+            &engine.selection.policy.identity(),
+        )?;
         if vectors.is_empty() {
             store::delete_meta(db, "index_dimension")?;
         } else {
@@ -412,6 +691,21 @@ fn build_with(
             docs.len() - missing.len()
         ))
     })
+}
+
+fn embed_fragments(
+    db: &mut Db,
+    engine: &Engine,
+    batch: &[(usize, String)],
+    means: &mut [mean::Mean],
+) -> Result<()> {
+    let texts: Vec<_> = batch.iter().map(|(_, text)| text.as_str()).collect();
+    let vectors = engine.embed(db, &texts)?;
+    ensure!(vectors.len() == texts.len(), "嵌入数量与文本分块数量不一致");
+    for ((idx, _), vector) in batch.iter().zip(vectors) {
+        means[*idx].push(&vector)?;
+    }
+    Ok(())
 }
 
 fn inferred_filter(query: &str, explicit: &Filter, today: NaiveDate) -> Filter {
@@ -464,7 +758,8 @@ pub(crate) fn search(
     limit: usize,
 ) -> Result<Vec<Repo>> {
     let dir = store::data_dir(conn)?;
-    search_with(conn, &dir, query, filter, limit, &Ollama::configured()?)
+    let engine = Engine::configured(conn)?;
+    search_with(conn, &dir, query, filter, limit, &engine)
 }
 
 fn search_with(
@@ -473,7 +768,7 @@ fn search_with(
     query: &str,
     filter: &Filter,
     limit: usize,
-    ollama: &Ollama,
+    engine: &Engine,
 ) -> Result<Vec<Repo>> {
     let query = query.trim();
     ensure!(!query.is_empty(), "请输入检索词");
@@ -482,20 +777,22 @@ fn search_with(
     }
     let filter = inferred_filter(query, filter, Utc::now().date_naive());
     filter.validate()?;
+    let key = engine.selection.identity();
     let owner = store::owner(conn)?;
     let snapshot = conn.transaction::<_, anyhow::Error, _>(|db| {
+        engine.check_current(db)?;
         let allowed = allowed_ids(db, &owner, &filter)?;
         if allowed.is_empty() {
             return Ok(None);
         }
         let current = generation(db)?;
-        check_model(db, &ollama.model, false)?;
+        check_model(db, &engine.selection, false)?;
         ensure!(current > 0, "尚未建立语义索引，请运行 starstack index");
         let projection = open_projection(
             &artifact_path(dir, &owner, current),
             current,
             &owner,
-            &ollama.model,
+            &key,
         )
         .context(
             "无法打开语义索引，请运行 starstack index 修复，或运行 starstack index --rebuild 重建",
@@ -504,7 +801,7 @@ fn search_with(
         if revision == "0"
             || store::meta(db, "indexed_library_revision")?.as_deref() != Some(&revision)
         {
-            check_fingerprints(db, &owner, &ollama.model, &allowed)?;
+            check_fingerprints(db, &owner, &key, &allowed)?;
         }
         let lists_revision = if filter.list.is_some() {
             store::meta(db, "lists_revision")?
@@ -523,15 +820,19 @@ fn search_with(
         return Ok(Vec::new());
     };
 
-    let prompt = if ollama.model.starts_with("qwen3-embedding") {
+    let instruct = match &engine.selection.provider {
+        Provider::Ollama { model, .. } => model.starts_with("qwen3-embedding"),
+        Provider::Builtin { family, .. } => *family == "qwen3-gguf",
+    };
+    let prompt = if instruct {
         format!(
             "Instruct: Given a search request, retrieve GitHub repositories that match the request.\nQuery: {query}"
         )
     } else {
         query.to_owned()
     };
-    let vector = ollama
-        .embed(&[&prompt])?
+    let vector = engine
+        .embed(conn, &[&prompt])?
         .pop()
         .context("missing query embedding")?;
     ensure!(
@@ -547,6 +848,7 @@ fn search_with(
         .context("查找向量失败，请检查嵌入模型或运行 starstack index --rebuild")?;
 
     conn.transaction(|db| {
+        engine.check_current(db)?;
         ensure!(
             generation(db)? == current
                 && library_revision(db)? == revision

@@ -25,6 +25,10 @@ fn command(dir: &Path) -> Command {
         .env("STARSTACK_SYNC_INTERVAL_MINUTES", "0")
         .env_remove("GITHUB_TOKEN")
         .env_remove("GH_TOKEN")
+        .env_remove("STARSTACK_AI_PROVIDER")
+        .env_remove("STARSTACK_MODEL")
+        .env_remove("STARSTACK_OLLAMA_URL")
+        .env_remove("STARSTACK_OLLAMA_DEFAULT_URL")
         .env_remove("STARSTACK_MCP_HOSTS");
     cmd
 }
@@ -161,6 +165,90 @@ fn http_accounts_confirmation_and_revocation() -> Result<()> {
             .as_str()
             .is_some_and(|s| s.contains("README"))
     );
+    let models = |cookie: &str| -> Result<Value> {
+        Ok(c.get(format!("{base}/api/models"))
+            .header("X-StarStack", "1")
+            .header(COOKIE, cookie)
+            .send()?
+            .error_for_status()?
+            .json()?)
+    };
+    let chat = |cookie: &str| -> Result<Value> {
+        Ok(c.get(format!("{base}/api/chat"))
+            .header("X-StarStack", "1")
+            .header(COOKIE, cookie)
+            .send()?
+            .error_for_status()?
+            .json()?)
+    };
+    assert_eq!(chat(&admin)?["configured"], false);
+    let config = json!({"provider":"ollama","base_url":"http://127.0.0.1:11333/v1","model":"chat:test","api_key":"fixture-secret"});
+    assert_eq!(post("chat", &reader, config.clone())?.status(), 403);
+    post("chat", &admin, config.clone())?.error_for_status()?;
+    assert_eq!(chat(&admin)?["has_key"], true);
+    assert!(!chat(&admin)?.to_string().contains("fixture-secret"));
+    assert!(chat(&reader)?["base_url"].is_null());
+    post(
+        "chat",
+        &admin,
+        json!({"provider":"ollama","base_url":"http://127.0.0.1:11334/v1","model":"chat:test"}),
+    )?
+    .error_for_status()?;
+    assert_eq!(chat(&admin)?["has_key"], false);
+    post("chat", &admin, json!({"provider":""}))?.error_for_status()?;
+    assert_eq!(chat(&reader)?["configured"], false);
+    let initial = models(&reader)?;
+    assert_eq!(initial["backend"], "builtin");
+    assert_eq!(initial["models"][0]["status"], "missing");
+    let source = json!({"id":"multilingual-minilm-l12-v2","source":"modelscope"});
+    assert_eq!(post("models/download", &reader, source)?.status(), 403);
+    assert_eq!(
+        post(
+            "models/delete",
+            &reader,
+            json!({"id":"multilingual-minilm-l12-v2"})
+        )?
+        .status(),
+        403
+    );
+    let endpoints = json!({"urls":["http://127.0.0.1:11434","https://ollama.example.test"]});
+    assert_eq!(
+        post("models/endpoints", &reader, endpoints.clone())?.status(),
+        403
+    );
+    post("models/endpoints", &admin, endpoints)?.error_for_status()?;
+    assert_eq!(
+        post(
+            "models/select",
+            &reader,
+            json!({"backend":"ollama","url":"http://unapproved.example.test","model":"x"})
+        )?
+        .status(),
+        400
+    );
+    post(
+        "models/select",
+        &reader,
+        json!({"backend":"ollama","url":"https://ollama.example.test","model":"remote:test"}),
+    )?
+    .error_for_status()?;
+    let saved = models(&reader)?;
+    assert_eq!(saved["ollama_url"], "https://ollama.example.test");
+    assert_eq!(saved["model"], "remote:test");
+    assert_eq!(models(&admin)?["backend"], "builtin");
+    assert_eq!(
+        post(
+            "models/chunking",
+            &reader,
+            json!({"strategy":"window","size":128,"overlap":65})
+        )?
+        .status(),
+        400
+    );
+    let windows = json!({"preset":"short"});
+    post("models/chunking", &reader, windows.clone())?.error_for_status()?;
+    assert_eq!(models(&reader)?["chunking"], windows);
+    assert_eq!(models(&admin)?["chunking"]["preset"], "balanced");
     let token = post("tokens", &reader, json!({"name":"desktop"}))?
         .error_for_status()?
         .json::<Value>()?;

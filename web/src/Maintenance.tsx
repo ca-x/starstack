@@ -2,6 +2,8 @@ import { t } from "./locale";
 import { useEffect, useState } from "react";
 import { EuiButton, EuiButtonEmpty } from "@elastic/eui";
 import { api, date, message, type Stats } from "./api";
+import { EmbeddingModels } from "./EmbeddingModels";
+import { ChatSettings } from "./ChatSettings";
 import { Schedule } from "./Schedule";
 import { Failure } from "./shared";
 
@@ -52,8 +54,8 @@ function DeviceAuth() {
 }
 
 export type Job = "sync" | "index" | "readmes";
-export function Maintenance({ stats, job, progress, error, run }: {
-  stats: Stats; job: Job | null; progress: string; error: string; run: (job: Job, full: boolean, requestId?: string) => Promise<void>;
+export function Maintenance({ stats, admin, job, progress, error, run }: {
+  stats: Stats; admin: boolean; job: Job | null; progress: string; error: string; run: (job: Job, full: boolean, requestId?: string) => Promise<void>;
 }) {
   return <>
     <div className="page-heading"><div><h1>{t("同步与索引")}</h1><p>{t("连接 GitHub、更新收藏并维护本地语义索引。")}</p></div></div>
@@ -64,10 +66,8 @@ export function Maintenance({ stats, job, progress, error, run }: {
         <dl className="inline-fact"><dt>{t("上次同步")}</dt><dd>{date(stats.last_sync, true)}</dd></dl>
         <div className="row-controls"><EuiButton fill isDisabled={!!job} onClick={() => run("sync", false)}>{t("增量同步")}</EuiButton>
           <EuiButton isDisabled={!!job} onClick={() => run("sync", true)}>{t("全量同步")}</EuiButton></div></section>
-      <section className="operation"><div><h2>{t("语义索引")}</h2><p>{t("为新增或变更的仓库建立索引。更换模型后可重建全部索引。")}</p></div>
-        <dl className="inline-fact"><dt>{t("嵌入模型")}</dt><dd>{stats.model || t("未配置")}</dd></dl>
-        <div className="row-controls"><EuiButton isDisabled={!!job} onClick={() => run("index", false)}>{t("更新索引")}</EuiButton>
-          <EuiButton isDisabled={!!job} onClick={() => run("index", true)}>{t("重建索引")}</EuiButton></div></section>
+      <EmbeddingModels admin={admin} jobActive={!!job} index={rebuild => run("index", rebuild)} fallbackModel={stats.model} />
+      <ChatSettings admin={admin} />
       <Schedule jobActive={!!job} fetchReadmes={() => run("readmes", false)} confirm={id => run("sync", false, id)} />
     </div>
   </>;

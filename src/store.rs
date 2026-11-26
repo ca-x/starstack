@@ -214,16 +214,27 @@ fn decode((raw, tags, note, pinned): Snapshot) -> Result<Repo> {
     r.pinned = pinned;
     Ok(r)
 }
+#[cfg(test)]
 pub(crate) fn repos(db: &mut Db) -> Result<Vec<Repo>> {
+    let mut result = Vec::new();
+    visit_repos(db, |repo| {
+        result.push(repo);
+        Ok(())
+    })?;
+    Ok(result)
+}
+
+pub(crate) fn visit_repos(db: &mut Db, mut visit: impl FnMut(Repo) -> Result<()>) -> Result<()> {
     use repositories as t;
     let owner = owner(db)?;
-    t::table
+    let rows = t::table
         .filter(t::owner_id.eq(owner).and(t::active.eq(true)))
         .select((t::metadata, t::tags, t::note, t::pinned))
-        .load::<Snapshot>(db)?
-        .into_iter()
-        .map(decode)
-        .collect()
+        .load_iter::<Snapshot, _>(db)?;
+    for row in rows {
+        visit(decode(row?)?)?;
+    }
+    Ok(())
 }
 pub(crate) fn by_id(db: &mut Db, id: i64) -> Result<Repo> {
     use repositories as t;
@@ -510,11 +521,11 @@ pub(crate) fn stats(db: &mut Db) -> Result<Stats> {
         lists: crate::lists::counts(db)?,
         tags,
         last_sync: meta(db, "last_sync")?,
-        model: crate::index::model(),
+        model: crate::index::configured_model(db)?,
     })
 }
 
-fn bump_revision(db: &mut Db) -> Result<()> {
+pub(crate) fn bump_revision(db: &mut Db) -> Result<()> {
     let v = meta(db, "library_revision")?
         .map(|v| v.parse::<u64>())
         .transpose()?

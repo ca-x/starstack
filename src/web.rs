@@ -43,6 +43,7 @@ struct App {
     base: Library,
     sessions: Mutex<HashMap<String, Session>>,
     jobs: Mutex<HashMap<String, Job>>,
+    model_download: Mutex<HashMap<String, Job>>,
     devices: Mutex<HashMap<(String, String), auth::Device>>,
     logins: Mutex<HashMap<String, (u32, Instant)>>,
 }
@@ -169,6 +170,113 @@ async fn login(
     )
         .into_response())
 }
+#[derive(Deserialize)]
+struct UploadQuery {
+    model: String,
+}
+
+async fn upload(
+    State(app): State<Shared>,
+    h: HeaderMap,
+    axum::extract::Query(query): axum::extract::Query<UploadQuery>,
+    mut files: axum::extract::Multipart,
+) -> Api<Json<Value>> {
+    use tokio::io::AsyncWriteExt;
+    check_header(&h)?;
+    let a = actor(&app, &h).await?;
+    if !a.admin {
+        return Err(ApiError(StatusCode::FORBIDDEN, "需要管理员权限".into()));
+    }
+    let custom = query.model == "custom";
+    if !custom
+        && !matches!(
+            query.model.as_str(),
+            crate::models::DEFAULT_ID | crate::models::QWEN_ID
+        )
+    {
+        return Err(ApiError(
+            StatusCode::BAD_REQUEST,
+            "未知的上传目标模型".into(),
+        ));
+    }
+    let lib = tenant(&app, &a.id);
+    let stage = tempfile::Builder::new()
+        .prefix(".starstack-upload-")
+        .tempdir_in(&lib.dir)
+        .context("无法创建临时上传目录")?;
+    let mut names = std::collections::HashSet::new();
+    while let Some(mut field) = files.next_field().await.context("上传表单读取失败")? {
+        let filename = match (field.name(), field.file_name()) {
+            (Some("pooling_config"), Some(_)) if custom => "1_Pooling/config.json",
+            (
+                Some("files"),
+                Some(
+                    name @ ("config.json"
+                    | "tokenizer.json"
+                    | "model.safetensors"
+                    | "model.gguf"
+                    | "Qwen3-Embedding-0.6B-q4_k_m.gguf"),
+                ),
+            ) => name,
+            _ => {
+                return Err(ApiError(
+                    StatusCode::BAD_REQUEST,
+                    "文件不在模型清单中".into(),
+                ));
+            }
+        }
+        .to_owned();
+        if !names.insert(filename.clone()) {
+            return Err(ApiError(
+                StatusCode::BAD_REQUEST,
+                "上传表单包含重复文件".into(),
+            ));
+        }
+        let path = stage.path().join(&filename);
+        if filename.starts_with("1_Pooling/") {
+            tokio::fs::create_dir(stage.path().join("1_Pooling"))
+                .await
+                .context("无法创建池化配置目录")?;
+        }
+        let mut dest = tokio::fs::File::create(path)
+            .await
+            .context("无法写入上传文件")?;
+        let limit = if filename == "tokenizer.json" {
+            64 * 1024 * 1024
+        } else if filename.ends_with(".json") {
+            1024 * 1024
+        } else {
+            1_500_000_000
+        };
+        let mut size = 0usize;
+        while let Some(part) = field.chunk().await.context("文件上传中断，请重试")? {
+            size = size.saturating_add(part.len());
+            if size > limit {
+                return Err(ApiError(
+                    StatusCode::PAYLOAD_TOO_LARGE,
+                    "文件超过模型导入大小限制".into(),
+                ));
+            }
+            dest.write_all(&part)
+                .await
+                .context("无法写入模型，请检查磁盘空间")?;
+        }
+        dest.flush().await.context("模型临时文件写入失败")?;
+    }
+    let installed = lib
+        .run(move |db| {
+            verify_admin(db, &a)?;
+            let model = if custom {
+                crate::models::import_custom(db, stage.path(), &|_| {})?
+            } else {
+                crate::models::import_files(db, &query.model, stage.path(), &|_| {})?
+            };
+            Ok(json!({"message":"模型已校验并安装","id":model.id}))
+        })
+        .await?;
+    Ok(Json(installed))
+}
+
 async fn logout(State(app): State<Shared>, h: HeaderMap) -> Api<Response> {
     check_header(&h)?;
     if let Some(token) = cookie(&h) {
@@ -243,6 +351,7 @@ async fn read(
     let lib = tenant(&app, &a.id);
     let v = match path.as_str() {
         "me" => json!(a),
+        "chat" => lib.run(move|db|crate::chat_settings::status(db,a.admin)).await?,
         "stats" => lib.run(|db| Ok(json!(store::stats(db)?))).await?,
         "tokens" => lib.run(|db| Ok(json!({"tokens": auth::tokens(db)?}))).await?,
         "users" if a.admin => lib.run(|db| {
@@ -254,6 +363,25 @@ async fn read(
         "users" => return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
         "proxy" if a.admin=>lib.run(crate::proxy::read_settings).await?,
         "proxy"=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
+        "organize/job" => lib.run(crate::organizer::progress).await?,
+        "models" => {
+            let mut panel = lib.run(crate::model_preferences::panel).await?;
+            let jobs = app.model_download.lock().expect("model download lock poisoned");
+            if let Some(models)=panel["models"].as_array_mut() {
+                for model in models {
+                    if let Some(job)=model["id"].as_str().and_then(|id|jobs.get(id)) && model["status"]!="ready" {
+                        if job.running {
+                            model["status"]=json!("downloading");
+                            model["error"]=Value::Null;
+                        } else if !job.message.is_empty() && model["status"]!="downloading" {
+                            model["status"]=json!("failed");
+                            model["error"]=json!(job.message);
+                        }
+                    }
+                }
+            }
+            panel
+        }
         "settings"=>lib.run(settings).await?,
         "progress" => {
             let jobs = app.jobs.lock().expect("jobs lock poisoned");
@@ -263,6 +391,14 @@ async fn read(
         _ => return Err(ApiError(StatusCode::NOT_FOUND,"没有此接口".into())),
     };
     Ok(Json(v))
+}
+fn verify_admin(db: &mut store::Db, actor: &auth::Account) -> Result<()> {
+    let current = auth::account(db, &actor.id)?;
+    ensure!(
+        current.admin && !current.disabled && current.revision == actor.revision,
+        "需要有效的管理员会话"
+    );
+    Ok(())
 }
 fn settings(db: &mut store::Db) -> Result<Value> {
     use crate::quota::{self, Policy, Resource, Window};
@@ -391,6 +527,83 @@ async fn write(
             let text = lib.run(move|db| library::export(&store::list(db,&q.filter,Sort::Time)?,q.format)).await?;
             let mime = match q.format { Format::Json=>"application/json", Format::Markdown=>"text/markdown; charset=utf-8" };
             return Ok(([(header::CONTENT_TYPE,mime)],text).into_response());
+        }
+        "chat" if !a.admin=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
+        "chat" => {
+            let input=value(body)?;
+            lib.run(move|db|db.immediate_transaction(|db|{verify_admin(db,&a)?;crate::chat_settings::update(db,input)})).await?;
+            json!({"message":"AI 聊天服务设置已保存"})
+        }
+        "models/search" => {let input=value(body)?;lib.run(move|db|crate::model_hub::search(db,input)).await?}
+        "organize/preview" => crate::organizer::preview(lib,body).await?,
+        "organize/apply" => lib.run(move|db|crate::organizer::manual(db,body)).await?,
+        "organize/start" => crate::organizer::start(lib,Some(body)).await?,
+        "organize/pause" => lib.run(crate::organizer::pause).await?,
+        "organize/resume" => crate::organizer::start(lib,None).await?,
+        "models/chunking" => {
+            let input=value(body)?;
+            lib.run(move|db|crate::chunking::save(db,input)).await?;
+            json!({"message":"分块设置已保存"})
+        }
+        "models/select" => {
+            let selection=value(body)?;
+            lib.run(move|db| crate::model_preferences::select(db,selection)).await?;
+            json!({"message":"Embedding 设置已保存"})
+        }
+        "models/endpoints" | "models/download" | "models/delete" | "models/hub-install" if !a.admin =>
+            return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
+        "models/endpoints" => {
+            #[derive(Deserialize)]
+            struct Endpoints { urls: Vec<String> }
+            let input:Endpoints=value(body)?;
+            lib.run(move|db|db.immediate_transaction(|db|{
+                verify_admin(db,&a)?;
+                crate::ollama_settings::set_endpoints(db,&input.urls)
+            })).await?;
+            json!({"message":"Ollama 服务地址已保存"})
+        }
+        "models/hub-install" => {
+            let source=string(&body,"source")?;
+            let repository=string(&body,"repository")?;
+            lib.run(move|db|{verify_admin(db,&a)?;let model=crate::models::download_custom(db,&source,&repository,&|_|{})?;Ok(json!({"message":"模型已安装","id":model.id}))}).await?
+        }
+        "models/delete" => {
+            let id=string(&body,"id")?;
+            let deleted=id.clone();
+            lib.run(move|db| {
+                verify_admin(db,&a)?;
+                crate::models::remove(db,&id)?;
+                Ok(())
+            }).await?;
+            app.model_download.lock().expect("model download lock poisoned").remove(&deleted);
+            json!({"message":"模型已移除"})
+        }
+        "models/download" => {
+            let id=string(&body,"id")?;
+            let source=string(&body,"source")?;
+            if !matches!(id.as_str(),crate::models::DEFAULT_ID|crate::models::QWEN_ID) || !matches!(source.as_str(),"modelscope"|"huggingface"){
+                return Err(ApiError(StatusCode::BAD_REQUEST,"模型或下载来源无效".into()));
+            }
+            {
+                let mut jobs=app.model_download.lock().expect("model download lock poisoned");
+                let job=jobs.entry(id.clone()).or_default();
+                if job.running {return Err(ApiError(StatusCode::CONFLICT,"模型下载正在进行".into()));}
+                job.running=true;
+                job.message.clear();
+            }
+            tokio::spawn(async move{
+                let downloaded=id.clone();
+                let result=lib.run(move|db| {
+                    verify_admin(db,&a)?;
+                    crate::models::install(db,&id,&source,&|_|{})?;
+                    Ok(())
+                }).await;
+                let mut jobs=app.model_download.lock().expect("model download lock poisoned");
+                let job=jobs.entry(downloaded).or_default();
+                job.running=false;
+                job.message=result.err().map(|e|format!("{e:#}")).unwrap_or_default();
+            });
+            return Ok((StatusCode::ACCEPTED,Json(json!({"message":"模型下载已启动"}))).into_response());
         }
         "readmes" => {
             let _background=start_job(app,lib,"readme",Run::default())?;
@@ -616,10 +829,15 @@ pub(crate) async fn serve(base: Library, bind: SocketAddr) -> Result<()> {
         base,
         sessions: Mutex::default(),
         jobs: Mutex::default(),
+        model_download: Mutex::default(),
         devices: Mutex::default(),
         logins: Mutex::default(),
     });
     let router = Router::new()
+        .route(
+            "/api/models/upload",
+            post(upload).layer(axum::extract::DefaultBodyLimit::max(1_610_612_736)),
+        )
         .route("/api/login", post(login))
         .route("/api/logout", post(logout))
         .route("/api/{*path}", get(read).post(write))

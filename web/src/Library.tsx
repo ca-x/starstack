@@ -2,6 +2,7 @@ import { languageName, t } from "./locale";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { EuiButton, EuiButtonEmpty, EuiFieldText, EuiSelect } from "@elastic/eui";
 import { api, date, message, request, type Filters, type Repo, type Sort, type Stats } from "./api";
+import { Organize } from "./Organize";
 import { Detail } from "./Detail";
 import { FilterPanel } from "./Filters";
 import { Failure, Icon, Language } from "./shared";
@@ -53,6 +54,7 @@ export function Library({ stats, initial, revision, onEdit, onSync }: {
   const [exporting, setExporting] = useState(false);
   const [retry, setRetry] = useState(0);
   const [selected, setSelected] = useState<Repo>();
+  const [organizing, setOrganizing] = useState(false);
   const inputRef = useRef<HTMLInputElement | null>(null);
 
   useEffect(() => {
@@ -123,6 +125,8 @@ export function Library({ stats, initial, revision, onEdit, onSync }: {
         <button className="quiet-control" aria-expanded={showFilters} aria-controls="filter-panel" onClick={() => setShowFilters(!showFilters)}>
           <Icon type="filter" />{t("筛选条件")}{activeFilters.length > 0 && <b>{activeFilters.length}</b>}
         </button>
+        {!query && <button className="quiet-control" aria-haspopup="dialog" onClick={() => setOrganizing(true)}>
+          <Icon type="sparkles" />{t("AI 整理")}</button>}
         {activeFilters.map((name, i) => <span className="tag" key={i}>{name}</span>)}
         {query && <button className="quiet-control" onClick={() => { setInput(""); setQuery(""); setPage(0); inputRef.current?.focus(); }}><Icon type="cross" />{t("结束搜索")}</button>}
       </div>
@@ -157,6 +161,8 @@ export function Library({ stats, initial, revision, onEdit, onSync }: {
       <EuiButtonEmpty size="s" isDisabled={exporting} onClick={() => download("json")}>JSON</EuiButtonEmpty>
     </div>}
     {exportError && <Failure error={exportError} />}
+    {organizing && <Organize filter={filters} scope={[...(filters.pinned ? [t("已置顶")] : []), ...activeFilters.filter((name): name is string => typeof name === "string")]}
+      close={() => setOrganizing(false)} refresh={onEdit} />}
     {selected && <Detail key={selected.id} repo={selected} close={() => setSelected(undefined)} saved={() => { setSelected(undefined); onEdit(); }} />}
   </>;
 }

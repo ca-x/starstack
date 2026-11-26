@@ -47,21 +47,9 @@ stars.example.com {
 
 打开 `https://stars.example.com/login` 登录。MCP 客户端可连接 `https://stars.example.com/mcp`，并以 `Authorization: Bearer <token>` 发送当前用户在管理页面签发的 MCP 令牌。若也需要经回环地址直接连接 MCP，可设 `STARSTACK_MCP_HOSTS=stars.example.com,localhost,127.0.0.1`。反向代理应保留请求的 Host，MCP 用它核对允许的域名。
 
-### 本地构建 Firecrawl Local 版本
+### 选择 README 抓取方式
 
-默认发布的二进制文件和 GHCR 镜像使用 GitHub REST 读取 README。需要用本机解析公开仓库页面时，构建时可显式启用 Cargo feature，再到「同步与索引」为自己的账号选择 Firecrawl Local。
-
-```bash
-# Compose，沿用上文的管理员和数据卷配置
-export STARSTACK_FEATURES=firecrawl-local
-docker compose up -d --build
-
-# 或者在仓库根目录构建本机可执行文件
-(cd web && npm ci && npm run build)
-cargo build --release --locked --features firecrawl-local
-```
-
-在 Docker CLI 中使用 `docker build --build-arg STARSTACK_FEATURES=firecrawl-local -t starstack:firecrawl .`。基础构建的 `STARSTACK_FEATURES` 为空。启用后，StarStack 读取 `github.com` 公开仓库的 HTML，在本机提取 README 并转换成 Markdown，每次至多并发处理 4 个公开仓库。私有仓库和可见性未知的仓库使用带身份认证的 GitHub REST API。抓取失败时保留旧文本和重试记录。可选依赖 `firecrawl-local` 的上游许可为 AGPL-3.0；构建或分发该组合时请核对上游条款。[Firecrawl Local crate](https://crates.io/crates/firecrawl-local/0.1.1) · [Firecrawl 上游](https://github.com/firecrawl/firecrawl)
+发布的二进制和容器镜像内置 Firecrawl Local。每个账号可在「同步与索引」选择 GitHub API 或 Firecrawl Local。Firecrawl Local 读取公开仓库的 GitHub 页面并在本机提取 README，同时最多处理 4 个公开仓库。私有仓库和可见性未知的仓库使用带身份认证的 GitHub REST API。抓取失败时保留旧文本并记录重试。Firecrawl Local 使用 AGPL-3.0 许可，构建或分发时请核对上游条款。[Firecrawl Local crate](https://crates.io/crates/firecrawl-local/0.1.1) · [Firecrawl 上游](https://github.com/firecrawl/firecrawl)
 
 ## 二进制文件
 
@@ -92,22 +80,51 @@ macOS 可用 `shasum -a 256 文件名` 核对摘要，再用 `chmod +x 文件名
 | `STARSTACK_ADMIN_PASSWORD` | 首次创建管理员使用的密码，长度为 8 至 1024 字节。 |
 | `STARSTACK_SECURE_COOKIE` | 通过 HTTPS 提供网页时设为 `1`，登录 Cookie 带 `Secure` 属性。 |
 | `STARSTACK_MCP_HOSTS` | HTTP MCP 接受的主机名，以逗号分隔。本机使用时省略，沿用 loopback 默认值。 |
-| `STARSTACK_HOME` | 保存 SQLite 数据库和 HawDB 向量索引的目录。容器使用 `/data`。 |
+| `STARSTACK_HOME` | 保存 SQLite 数据库、HawDB 向量索引和已下载模型的目录。容器使用 `/data`。 |
 | `STARSTACK_GITHUB_CLIENT_ID` | 使用 GitHub 设备授权登录时设置为已启用 Device Flow 的 GitHub OAuth App 的 Client ID。此流程无需 client secret。 |
 | `STARSTACK_GITHUB_SCOPE` | GitHub 设备授权请求的 OAuth scope，默认留空。需要访问私有仓库时可显式设为 `repo`。 |
-| `STARSTACK_PROXY_URL` | 可选的实例级 GitHub 出站代理，支持 HTTP、HTTPS、SOCKS5、SOCKS5h。非空值优先于管理后台配置。 |
+| `STARSTACK_PROXY_URL` | GitHub 请求及模型下载共用的出站代理，支持 HTTP、HTTPS、SOCKS5、SOCKS5h。非空值优先于管理后台配置。 |
 | `STARSTACK_README_INTERVAL_MINUTES` | 用户未保存自定义间隔时，后台补全待处理 README 的默认间隔，单位为分钟，默认 30，范围 0 至 10080。设为 0 暂停此后台任务。 |
 | `STARSTACK_SYNC_INTERVAL_MINUTES` | Web 服务后台同步的间隔，单位为分钟，默认 360。设为 0 可关闭定时同步。每轮核对完整收藏列表，并针对变更重新计算向量。 |
 | `GITHUB_TOKEN` 或 `GH_TOKEN` | 初始管理员用于 GitHub 同步的令牌，其他用户需分别授权。Compose 优先采用 `GITHUB_TOKEN`，其次采用 `GH_TOKEN`。 |
-| `STARSTACK_OLLAMA_URL` | 由你管理的 Ollama 服务的基址，例如本机使用 `http://127.0.0.1:11434`。Compose 默认为 `http://host.docker.internal:11434`。 |
-| `STARSTACK_MODEL` | Ollama 嵌入模型名称，默认 `qwen3-embedding:0.6b`。 |
-| `STARSTACK_AI_PROVIDER` | Aimux 对话服务商 ID，默认 `ollama`。 |
-| `STARSTACK_AI_MODEL` | 对话模型。Ollama 默认 `qwen3:4b`，选择其他服务商时必须设置。 |
-| `STARSTACK_AI_BASE_URL` | 对话 API 基址，可选。Ollama 默认使用 `STARSTACK_OLLAMA_URL` 加 `/v1`。 |
+| `STARSTACK_HF_ENDPOINT` | Hugging Face 下载源的根地址，默认 `https://huggingface.co`，可改为部署者信任的兼容镜像。 |
+| `STARSTACK_MODELSCOPE_ENDPOINT` | ModelScope 下载源的根地址，默认 `https://modelscope.cn`，可改为部署者信任的兼容镜像。 |
+| `STARSTACK_OLLAMA_DEFAULT_URL` | 管理员尚未保存地址列表时提供的 Ollama 地址。本机默认 `http://127.0.0.1:11434`，Compose 默认 `http://host.docker.internal:11434`。新库仍默认使用内置检索模型。 |
+| `STARSTACK_OLLAMA_URL` | 兼容旧部署。显式设置后，尚未选择后端的资料库默认使用 Ollama，此地址优先于 `STARSTACK_OLLAMA_DEFAULT_URL`。 |
+| `STARSTACK_MODEL` | Ollama 的默认嵌入模型名，默认为 `qwen3-embedding:0.6b`。显式设置也会让尚未选择后端的资料库默认使用 Ollama。 |
+| `STARSTACK_AI_PROVIDER` | Aimux 对话服务商 ID，例如 `ollama` 或 `openai`。默认尚未配置。 |
+| `STARSTACK_AI_MODEL` | 聊天服务上可用的具体模型名，例如本地 Ollama 的 `qwen3:4b`。 |
+| `STARSTACK_AI_BASE_URL` | 对话 API 基址。Ollama 需显式设置它（含 `/v1`），或设置 `STARSTACK_OLLAMA_URL` 并使用其 `/v1` 路径。 |
 | `STARSTACK_AI_API_KEY` | 远程对话服务所需的密钥。本地 Ollama 无需密钥。 |
 | `STARSTACK_TAG` | Compose 拉取的 GHCR 镜像标签，默认为 `latest`。 |
 
-使用语义搜索时，在运行 Ollama 的机器上执行 `ollama pull qwen3-embedding:0.6b`，或拉取 `STARSTACK_MODEL` 指定的模型。容器内的 `127.0.0.1` 指向容器本身。Linux 上使用宿主机的 Ollama 时，请让该服务监听 Docker 网桥可达的宿主机地址，并按需限制访问。若 Ollama 与 StarStack 位于同一 Compose 网络，可把 `STARSTACK_OLLAMA_URL` 设为 `http://ollama:11434`，其中 `ollama` 为服务名。
+### 检索模型与分块
+
+新资料库默认在本机 CPU 上运行多语言模型 Multilingual MiniLM-L12-v2，生成 384 维检索向量。首次建索引前，管理员打开 **同步与索引 → 语义索引 → 内置模型文件**，选择 Hugging Face 或 ModelScope 并点击 **下载模型**。模型约 458 MiB，两处提供相同的文件。页面显示下载进度。中断后可重试或切换来源，星栈会续传，并在各文件通过固定版本的 SHA-256 校验后启用模型。
+
+在终端中也可安装，Compose 部署在下列命令前加 `docker compose exec starstack`。模型文件保存在 `STARSTACK_HOME/models` 下，供同一实例所有账号使用。安装后即可离线检索。
+
+```bash
+starstack models download --source modelscope
+starstack models list
+```
+
+使用 Hugging Face 时将来源换为 `huggingface`。如需镜像，设置对应的 `STARSTACK_HF_ENDPOINT` 或 `STARSTACK_MODELSCOPE_ENDPOINT`。填入 HTTP(S) 服务根地址，例如 `STARSTACK_HF_ENDPOINT=https://hf-mirror.com`。镜像需提供对应上游的仓库路径，并支持按固定提交获取文件。若要释放磁盘空间，先在引用模型的账号中切换后端并重建索引，再由管理员删除模型文件，或运行 `starstack models remove`。
+
+**其他模型与离线安装。** 内置目录的 Qwen3-Embedding-0.6B Q4_K_M 使用 Mungert 发布的量化 GGUF 和 Qwen 官方 tokenizer，向量维度为 1024。终端下载可用 `starstack models download qwen3-embedding-0.6b-q4-k-m --source huggingface`。管理员可从界面搜索 Hugging Face 或 ModelScope，也可上传模型。按预设离线导入时，MiniLM 需要 `config.json`、`tokenizer.json` 和 `model.safetensors`，Qwen 需要 Q4_K_M 的 `.gguf` 权重和 `tokenizer.json`。星栈会逐个核对固定 SHA-256。
+
+自定义导入支持 384 维、均值池化的 Sentence Transformers BERT 模型。提供 `config.json`、`tokenizer.json`、单个 `model.safetensors`（最多 512 MiB）和 `1_Pooling/config.json`。星栈核对配置、实际权重和分词器，完成一次 CPU 编码后注册模型。新模型按文件内容生成独立 ID，账号可在「语义索引」中选择并重建索引。[Qwen 官方模型](https://huggingface.co/Qwen/Qwen3-Embedding-0.6B) · [Q4_K_M 转换仓库](https://huggingface.co/Mungert/Qwen3-Embedding-0.6B-GGUF)
+
+**使用 Ollama 检索。** 在 Ollama 所在的机器拉取嵌入模型，例如 `ollama pull qwen3-embedding:0.6b`。管理员在「语义索引」展开「管理 Ollama 服务地址」，添加 StarStack 服务器可访问的地址。各账号选择 Ollama、服务地址和该服务已安装的模型名，再点「使用此模型」。所选服务会收到用于索引的仓库文本、私人批注和搜索时的查询。初始库也可通过 CLI 设置，以下示例使用本机默认地址。
+
+```bash
+starstack models select ollama --url http://127.0.0.1:11434 --model qwen3-embedding:0.6b
+starstack index --rebuild
+```
+
+容器内的 `127.0.0.1` 指向容器本身。使用宿主机 Ollama 时，选择 Compose 提供的 `http://host.docker.internal:11434`，并让 Ollama 监听容器可达的地址。若两个服务在同一 Compose 网络，可通过 `STARSTACK_OLLAMA_DEFAULT_URL=http://ollama:11434` 配置默认地址，其中 `ollama` 为服务名。已保存过地址列表的管理员可直接在界面中添加地址。
+
+**调整文本分块。** 在「语义索引」的「分块预设」中，为当前账号和当前后端选择预设。均衡模式每块 512 个 Unicode 字符，相邻块重叠 64 个字符。短分块为 192/24，长分块为 1024/128，整篇用于兼容旧索引。新库默认使用均衡模式，原有 Ollama 索引沿用整篇。更改后端、服务地址、模型或分块设置后，按页面提示在该账号下点击「重建索引」。本机 CLI 使用 `starstack index --rebuild` 重建初始库。
 
 ### 大收藏库、GitHub 分类与 README 配额
 
@@ -129,7 +146,7 @@ REST 分页支持 gzip 传输。一次无凭据的公开样本中，100 条 Star
 
 ### 配置 GitHub 出站代理
 
-实例管理员可以在 **用户管理 → 实例代理** 设置所有账号共用的连接方式。GitHub 设备授权、收藏及分类同步、README 抓取使用同一代理。保存的设置用于后续新建的连接。**跟随系统代理** 使用服务进程的默认代理环境，包括 `HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`。**直接连接** 绕过系统代理。**指定代理** 支持 `http://`、`https://`、`socks5://` 和 `socks5h://`，其中 `socks5h` 将目标域名交由代理解析。
+实例管理员可以在 **用户管理 → 实例代理** 设置所有账号共用的连接方式。GitHub 设备授权、收藏及分类同步、README 抓取和内置模型下载使用同一代理。保存的设置用于后续新建的连接。**跟随系统代理** 使用服务进程的默认代理环境，包括 `HTTPS_PROXY`、`ALL_PROXY` 和 `NO_PROXY`。**直接连接** 绕过系统代理。**指定代理** 支持 `http://`、`https://`、`socks5://` 和 `socks5h://`，其中 `socks5h` 将目标域名交由代理解析。
 
 也可在 Compose 的 `.env` 中设置 `STARSTACK_PROXY_URL=socks5h://host.docker.internal:1080` 后重新创建容器。该变量非空时覆盖数据库中的设置，后台显示为只读。将它取消并重新启动服务后，恢复数据库中的配置。尚未配置的实例默认跟随系统代理。容器访问宿主机代理时，代理需监听容器可达的地址。需要认证时可使用 `http://用户名:密码@代理主机:端口`，凭据中含 `@`、`:` 等保留字符时请按 URL 百分号编码。后台只回显主机和端口，替换地址时需要重新输入认证信息。使用后台保存时，代理地址及凭据保存在实例 SQLite 文件中，因此数据库及其备份应当与部署凭据同等保护。
 
@@ -152,7 +169,7 @@ STARSTACK_GITHUB_SCOPE=
 
 ### 使用 Aimux 问答
 
-StarStack 默认将问答发给本机 Ollama。在 Ollama 所在的机器执行 `ollama pull qwen3:4b`，即可与上面的嵌入模型配合使用。选择 AI 问答时，StarStack 发送问题原文，以及当前账号筛选出的至多五个候选仓库的名称、摘要（最多 1024 个字符）、语言和来源编号。答案里的 `[1]` 等编号对应候选列表。私人标签、备注、README、GitHub 令牌和管理员凭据均不在对话请求中。
+问答和 AI 整理默认尚未配置。管理员在后台配置 Aimux，或显式设置对话服务商、地址和模型。使用宿主机上的 Ollama 时，在宿主机执行 `ollama pull qwen3:4b`，Compose 的 `.env` 中填写 `STARSTACK_AI_PROVIDER=ollama`、`STARSTACK_AI_BASE_URL=http://host.docker.internal:11434/v1` 和 `STARSTACK_AI_MODEL=qwen3:4b`，再运行 `docker compose up -d`。检索模型由每个账号独立选择。选择 AI 问答时，StarStack 发送问题原文，以及当前账号筛选出的至多五个候选仓库的名称、摘要（最多 1024 个字符）、语言和来源编号。答案里的 `[1]` 等编号对应候选列表。私人标签、备注、README、GitHub 令牌和管理员凭据均不在对话请求中。
 
 若显式选择远程对话服务，该服务会收到上述问题和元数据，其中可能含私有仓库名称。以下示例选择 OpenAI；在 Bash 中输入密钥后，重新创建 Compose 容器或重新启动二进制服务即可生效。模型 ID 需在服务商账号中可用。[Aimux 官方仓库](https://github.com/arcships/aimux)
 
@@ -163,8 +180,6 @@ read -rsp '对话服务密钥：' STARSTACK_AI_API_KEY
 echo
 export STARSTACK_AI_API_KEY
 ```
-
-向量索引和生成回答使用独立的模型。索引请求会把仓库文本及个人整理内容提交给 `STARSTACK_OLLAMA_URL` 指向的嵌入服务，请将该地址设为自己的实例。
 
 备份前停止写入，以便数据库和索引处于一致状态。本机部署复制整个 `STARSTACK_HOME` 目录。Compose 部署可先执行 `docker compose stop starstack`，再执行 `docker compose cp starstack:/data/. ./starstack-backup`，最后执行 `docker compose start starstack`。
 

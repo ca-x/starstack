@@ -123,7 +123,7 @@ function Admin() {
     <a className="skip" href="#main" onClick={e => { e.preventDefault(); main.current?.focus(); }}>{t("跳到主要内容")}</a>
     <header className="topbar"><div className="header-brand"><button ref={menuButton} className="mobile-toggle" aria-label={t("切换导航")} aria-expanded={mobileNav}
       aria-controls="navigation" onClick={() => setMobileNav(!mobileNav)}><Icon type={mobileNav ? "cross" : "menu"} /></button><Brand /><span className="brand-divider">{t("收藏管理台")}</span></div>
-      <div className="profile-menu"><PreferenceMenu /><span>{profile.username}</span><EuiButtonEmpty size="s" isDisabled={loggingOut} iconType="logOut" onClick={logout}>{t("退出登录")}</EuiButtonEmpty></div></header>
+      <div className="profile-menu"><PreferenceMenu /><span>{profile.username}</span><EuiButtonEmpty size="s" aria-label={t("退出登录")} title={t("退出登录")} isDisabled={loggingOut} iconType="logOut" onClick={logout}><span className="signout-label">{t("退出登录")}</span></EuiButtonEmpty></div></header>
     <aside id="navigation" className={mobileNav ? "rail is-open" : "rail"}><nav aria-label={t("主导航")}>
       <span className="nav-label">{t("工作区")}</span><div className="nav-group">{navigation().map(([href, name, icon]) => navItem(href, name, icon, href === "#library" ? stats.total : undefined))}{profile.admin && navItem("#users", t("用户管理"), usersIcon)}</div>
       {Object.keys(stats.tags).length > 0 && <><span className="nav-label">{t("我的标签")}</span><div className="nav-group">{counts(stats.tags).map(([name, n]) => navItem(tagLink(name), name, tagIcon, n))}</div></>}
@@ -131,7 +131,7 @@ function Admin() {
     <main id="main" className="workspace" tabIndex={-1} ref={main}>
       {statsError && <Failure error={statsError} retry={refresh} />}{logoutError && <Failure error={logoutError} />}
       {job && route !== "#sync" && <a href="#sync" className="progress-note">{progress || t("查看任务进度")} <Icon type="arrowRight" /></a>}
-      {route === "#sync" ? <Maintenance stats={stats} job={job || (externalRunning ? "sync" : null)} progress={progress} error={jobError} run={run} /> :
+      {route === "#sync" ? <Maintenance stats={stats} admin={profile.admin} job={job || (externalRunning ? "sync" : null)} progress={progress} error={jobError} run={run} /> :
         route === "#users" && profile.admin ? <Users /> : route === "#mcp" ? <Mcp /> : route === "#statistics" ? <Statistics stats={stats} tagLink={tagLink} /> :
         <Library key={route} stats={stats} initial={{ pinned: route === "#pinned" || undefined, tag }} revision={revision} onEdit={refresh} onSync={() => { location.hash = "sync"; }} />}
     </main>

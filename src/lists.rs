@@ -1,4 +1,6 @@
 //! Mirror the authenticated user's GitHub Star Lists independently from private annotations.
+pub(crate) mod organize;
+
 use std::collections::{BTreeMap, BTreeSet};
 use std::time::Duration;
 
@@ -153,6 +155,7 @@ impl GitHub<'_> {
         let (body, delay) = self.post(
             db,
             &json!({"query":request.as_ref(),"variables":&variables}),
+            !query.trim_start().starts_with("mutation "),
         )?;
         // GitHub may return HTTP 200 with partial data and errors. Do not publish such snapshots.
         let envelope: Envelope<Value> =
@@ -165,7 +168,7 @@ impl GitHub<'_> {
             let mut window = Window::load(db, Resource::Graphql)?;
             window.defer(delay);
             window.save(db, Resource::Graphql)?;
-            bail!("GitHub GraphQL 请求达到额度，请在 {delay} 秒后重试，原有分类已保留");
+            bail!("GitHub GraphQL 请求达到额度，请在 {delay} 秒后重试");
         }
         // Older Enterprise schemas expose only databaseId. Avoid selecting that 32-bit
         // field on servers that support fullDatabaseId, since it can overflow independently.
@@ -183,7 +186,7 @@ impl GitHub<'_> {
         }
         if let Some(e) = envelope.errors.first() {
             bail!(
-                "GitHub 分类查询失败（{}{}），原有分类已保留",
+                "GitHub 分类查询失败（{}{}）",
                 e.kind
                     .as_ref()
                     .map(|k| format!("{k} · "))
@@ -195,17 +198,17 @@ impl GitHub<'_> {
             .context("GitHub 分类数据不完整")
     }
 
-    fn post(&self, db: &mut Db, payload: &Value) -> Result<(Vec<u8>, u64)> {
-        const ATTEMPTS: u8 = 3;
+    fn post(&self, db: &mut Db, payload: &Value, retry_safe: bool) -> Result<(Vec<u8>, u64)> {
+        let attempts: u8 = if retry_safe { 3 } else { 1 };
         let reserve = Policy::load(db)?.reserve_percent;
-        for attempt in 1..=ATTEMPTS {
+        for attempt in 1..=attempts {
             let mut window = Window::load(db, Resource::Graphql)?;
             window.check()?;
             ensure!(
                 window.has_headroom(reserve),
-                "GraphQL 额度已降至保留线，请在重置后刷新，原有分类已保留"
+                "GraphQL 额度已降至保留线，请在重置后刷新"
             );
-            let retry = attempt < ATTEMPTS;
+            let retry = attempt < attempts;
             let backoff = Duration::from_millis(250 * u64::from(attempt));
             let response = match self
                 .client
@@ -219,7 +222,7 @@ impl GitHub<'_> {
                     std::thread::sleep(backoff);
                     continue;
                 }
-                Err(e) => return Err(e).context("无法连接 GitHub GraphQL，原有分类已保留"),
+                Err(e) => return Err(e).context("无法连接 GitHub GraphQL"),
             };
             let status = response.status();
             let headers = response.headers();
@@ -255,16 +258,16 @@ impl GitHub<'_> {
                 if limited || secondary {
                     window.defer(delay);
                     window.save(db, Resource::Graphql)?;
-                    bail!("GitHub GraphQL 请求达到额度，请在 {delay} 秒后重试，原有分类已保留");
+                    bail!("GitHub GraphQL 请求达到额度，请在 {delay} 秒后重试");
                 }
-                bail!("GitHub 分类请求返回 {status}，请稍后重试或检查授权，原有分类已保留");
+                bail!("GitHub 分类请求返回 {status}，请稍后重试或检查授权");
             }
             match response.bytes() {
                 Ok(body) => return Ok((body.to_vec(), delay)),
                 Err(e) if retry && (e.is_body() || e.is_timeout() || e.is_decode()) => {
                     std::thread::sleep(backoff);
                 }
-                Err(e) => return Err(e).context("读取 GitHub GraphQL 响应失败，原有分类已保留"),
+                Err(e) => return Err(e).context("读取 GitHub GraphQL 响应失败"),
             }
         }
         unreachable!("the final attempt always returns its result")
@@ -500,21 +503,30 @@ fn collect_items(
 }
 
 pub(crate) fn refresh(db: &mut Db, progress: &dyn Fn(&str)) -> Result<String> {
-    let api = std::env::var("STARSTACK_GITHUB_API_URL")
-        .unwrap_or_else(|_| "https://api.github.com".to_owned());
-    let api = api.trim_end_matches('/');
+    let api = api_base();
     let token = crate::auth::github_token(db)?;
-    let gh = GitHub {
+    let gh = github_client(db, &api, &token)?;
+    refresh_with(db, &api, &gh, progress)
+}
+
+fn api_base() -> String {
+    std::env::var("STARSTACK_GITHUB_API_URL")
+        .unwrap_or_else(|_| "https://api.github.com".to_owned())
+        .trim_end_matches('/')
+        .to_owned()
+}
+
+fn github_client<'a>(db: &mut Db, api: &str, token: &'a str) -> Result<GitHub<'a>> {
+    Ok(GitHub {
         client: crate::proxy::builder(db)?
             .user_agent("starstack")
             .timeout(Duration::from_secs(30))
             .redirect(reqwest::redirect::Policy::none())
             .build()?,
         url: endpoint(api)?,
-        token: &token,
+        token,
         legacy_ids: Default::default(),
-    };
-    refresh_with(db, api, &gh, progress)
+    })
 }
 
 fn check_account(db: &mut Db, api: &str, id: &str) -> Result<()> {
@@ -553,48 +565,13 @@ fn bind_account(db: &mut Db, api: &str, account: &str) -> Result<()> {
     Ok(())
 }
 
-fn refresh_with(
+fn fetch_members(
     db: &mut Db,
-    api: &str,
     gh: &GitHub<'_>,
+    remote: &BTreeMap<String, List>,
+    candidates: &[&str],
     progress: &dyn Fn(&str),
-) -> Result<String> {
-    ensure!(
-        store::meta(db, "github_api")?
-            .as_deref()
-            .is_none_or(|saved| saved == api),
-        "此资料库已绑定其他 GitHub API 地址，请恢复原地址"
-    );
-    let owner = store::owner(db)?;
-    let (revision, observed, old) = db.transaction::<_, anyhow::Error, _>(|db| {
-        let observed = store::meta(db, "lists_observed_at")?
-            .map(|v| v.parse::<i64>())
-            .transpose()?;
-        Ok((
-            store::meta(db, "lists_revision")?,
-            observed,
-            cached(db, &owner)?,
-        ))
-    })?;
-    let started = chrono::Utc::now().timestamp();
-    progress("正在读取 GitHub 收藏分类");
-    let (account, remote) = catalog(db, api, gh)?;
-    check_account(db, api, &account)?;
-    let candidates: Vec<_> = remote
-        .iter()
-        .filter(|(id, list)| {
-            old.get(*id) != Some(*list)
-                || observed.is_some_and(|t| {
-                    // GitHub timestamps can be rounded to seconds. Re-read a list at the previous
-                    // snapshot boundary to catch a same-count swap within that second.
-                    [&list.added, &list.updated]
-                        .into_iter()
-                        .filter_map(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
-                        .any(|stamp| stamp.timestamp() >= t.saturating_sub(1))
-                })
-        })
-        .map(|(id, _)| id.as_str())
-        .collect();
+) -> Result<BTreeMap<String, BTreeSet<i64>>> {
     let populated: Vec<_> = candidates
         .iter()
         .copied()
@@ -621,6 +598,61 @@ fn refresh_with(
             fetched.insert(id.clone(), collect_items(db, gh, &id, &remote[&id], page)?);
         }
     }
+    Ok(fetched)
+}
+
+fn dirty_lists(db: &mut Db) -> Result<BTreeSet<String>> {
+    Ok(store::meta(db, "lists_dirty")?
+        .map(|s| serde_json::from_str(&s))
+        .transpose()?
+        .unwrap_or_default())
+}
+
+fn refresh_with(
+    db: &mut Db,
+    api: &str,
+    gh: &GitHub<'_>,
+    progress: &dyn Fn(&str),
+) -> Result<String> {
+    ensure!(
+        store::meta(db, "github_api")?
+            .as_deref()
+            .is_none_or(|saved| saved == api),
+        "此资料库已绑定其他 GitHub API 地址，请恢复原地址"
+    );
+    let owner = store::owner(db)?;
+    let (revision, observed, old, dirty) = db.transaction::<_, anyhow::Error, _>(|db| {
+        let observed = store::meta(db, "lists_observed_at")?
+            .map(|v| v.parse::<i64>())
+            .transpose()?;
+        Ok((
+            store::meta(db, "lists_revision")?,
+            observed,
+            cached(db, &owner)?,
+            dirty_lists(db)?,
+        ))
+    })?;
+    let started = chrono::Utc::now().timestamp();
+    progress("正在读取 GitHub 收藏分类");
+    let (account, remote) = catalog(db, api, gh)?;
+    check_account(db, api, &account)?;
+    let candidates: Vec<_> = remote
+        .iter()
+        .filter(|(id, list)| {
+            dirty.contains(*id)
+                || old.get(*id) != Some(*list)
+                || observed.is_some_and(|t| {
+                    // GitHub timestamps can be rounded to seconds. Re-read a list at the previous
+                    // snapshot boundary to catch a same-count swap within that second.
+                    [&list.added, &list.updated]
+                        .into_iter()
+                        .filter_map(|s| chrono::DateTime::parse_from_rfc3339(s).ok())
+                        .any(|stamp| stamp.timestamp() >= t.saturating_sub(1))
+                })
+        })
+        .map(|(id, _)| id.as_str())
+        .collect();
+    let fetched = fetch_members(db, gh, &remote, &candidates, progress)?;
     use github_list_members as m;
     use github_lists as l;
     db.immediate_transaction(|db| {
@@ -689,6 +721,7 @@ fn refresh_with(
         store::set_meta(db, "github_api", api)?;
         store::set_meta(db, "github_account", &account)?;
         store::set_meta(db, "lists_observed_at", &started.to_string())?;
+        store::delete_meta(db, "lists_dirty")?;
         store::set_meta(db, "lists_last_sync", &chrono::Utc::now().to_rfc3339())?;
         Ok(format!(
             "GitHub 收藏分类共 {} 个，更新 {} 个，移除 {} 个",
