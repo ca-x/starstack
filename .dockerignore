@@ -1,0 +1,16 @@
+.git
+.github
+.nightshift
+**/target
+**/node_modules
+**/dist
+.env
+.env.*
+**/.env
+**/.env.*
+.starstack
+data
+*.sqlite*
+*.db*
+docs/screenshots
+*.hawdb

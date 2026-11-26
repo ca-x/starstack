@@ -1,0 +1,13 @@
+{
+  "mcpServers": {
+    "starstack": {
+      "command": "/absolute/path/to/starstack",
+      "args": ["mcp"],
+      "env": {
+        "STARSTACK_HOME": "/absolute/path/to/your/starstack-data",
+        "STARSTACK_MODEL": "qwen3-embedding:0.6b",
+        "STARSTACK_OLLAMA_URL": "http://127.0.0.1:11434"
+      }
+    }
+  }
+}

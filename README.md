@@ -1,0 +1,131 @@
+<p align="center"><img src="web/src/assets/logo-display.webp" width="96" alt="星栈"></p>
+
+# 星栈 / StarStack
+
+[English](README.en.md)
+
+「去年 star 的那个 Rust 解析器叫什么？」星栈从你自己的 GitHub 收藏里按语义查找，返回仓库链接、收藏日期，以及你留下的标签和备注。一个 Rust 二进制同时提供 CLI、Web 管理后台和 MCP 服务。
+
+## 从零到第一次检索
+
+1. **构建或取得二进制。** 从源码构建需要 Rust 1.97.1 或更新版本和 Node.js 24。以下命令在仓库根目录运行，生成的 `target/release/starstack` 已内置 Web 界面。后文用 `starstack` 指代这个文件，可将它放入 PATH。用 Docker 运行见[部署说明](docs/deploy.md)。
+
+   ```bash
+   (cd web && npm ci && npm run build)
+   cargo build --release --locked
+   ```
+
+2. **准备本机 embedding。** 启动 Ollama 服务后拉取多语言模型。只有需要在软件内生成 AI 推荐时，才需额外拉取聊天模型 `ollama pull qwen3:4b`。
+
+   ```bash
+   ollama pull qwen3-embedding:0.6b
+   ```
+
+3. **连接自己的 GitHub。** 本机已登录 GitHub CLI 时，运行 **`starstack auth login --gh`** 即可。星栈仅记录凭证来源，在同步时向本机 `gh` 读取当前账号的凭证。已有个人 token 也可设 `GITHUB_TOKEN`。使用设备码时，设置你自己的 GitHub OAuth App 的 Client ID，然后在浏览器输入星栈显示的短码。如果服务器需要代理，可先设置环境变量 `STARSTACK_PROXY_URL`，支持 HTTP 和 SOCKS5；输入短码可使用另一台能访问 GitHub 的设备。访问公开收藏可保持默认的空 scope。App 注册和 Compose 参数见[设备授权设置](docs/deploy.md)。
+
+   ```bash
+   export STARSTACK_GITHUB_CLIENT_ID='你的 OAuth App Client ID'
+   starstack auth login
+   ```
+
+4. **同步并检索。** 首次同步遍历全部收藏，先保存仓库描述、语言、topics 和许可证，再按本轮预算补抓 README 并建立本地索引。完成后即可用中文或英文查询。示例查询的结果取决于你实际收藏的项目。
+
+   ```bash
+   starstack sync
+   starstack search '那个做本地向量检索的 Go 库'
+   ```
+
+## 使用管理后台
+
+首次建管理员账号时运行下面的 Bash 命令。密码至少 8 字节。打开 <http://127.0.0.1:8080/login>。从「同步与索引」连接 GitHub、同步和调整周期，从「收藏库」搜索、筛选、批注或导出。右上角偏好可切换中英文和浅深主题。
+
+```bash
+export STARSTACK_ADMIN_USER=admin
+read -rsp '管理员密码：' STARSTACK_ADMIN_PASSWORD && echo
+export STARSTACK_ADMIN_PASSWORD
+starstack serve
+```
+
+管理员可以创建账号、启停用户、设置角色和重置密码。每个账号拥有自己的收藏、批注、GitHub 授权、定时配置和 MCP token。管理员的初始库与本机 CLI 共用；其他用户通过 Web 或带个人 token 的 HTTP MCP 访问自己的收藏。密码或角色变更后重新登录，并为助手签发新 token。
+
+## GitHub 收藏分类
+
+在 GitHub Stars 中手工创建的 Lists 通过 GraphQL 同步，保留分类名称和成员关系。先运行 `starstack lists --refresh` 查看自己的分类，再按名称筛选。私人标签由星栈保存在本地，同一仓库可以同时属于多个 GitHub 分类并带有私人标签。[GitHub Stars 与 Lists](https://docs.github.com/en/get-started/exploring-projects-on-github/saving-repositories-with-stars)
+
+```bash
+starstack lists
+starstack list --list "Dev tools"
+starstack search '命令行模糊搜索' --list "Dev tools"
+```
+
+将 `Dev tools` 替换成已有分类名。分类总览显示 GitHub 返回的成员数，筛选结果只包含当前账号仍在收藏目录中的仓库。MCP 工具 `search_stars` 接受相同含义的 JSON 参数，例如 `{"query":"命令行模糊搜索","list":"Dev tools"}`。
+
+## 整理与导出
+
+```bash
+starstack list --sort stars --language Rust --archived false
+starstack tag clap-rs/clap 命令行
+starstack note clap-rs/clap '下次给发布工具加子命令时用'
+starstack pin clap-rs/clap
+starstack index
+starstack search '做命令行工具' --tag 命令行 --since 2025-01-01
+starstack export --pinned true --output 精选.md
+starstack export --format json --output stars.json
+```
+
+把仓库名替换为自己的收藏。列表和详情会立即显示修改。下次检索会自动补齐变化的批注向量，也可用 `starstack index` 提前更新。导出的文件包含私人批注，请在分享前核对。[Markdown 示例](examples/collection.md) · [JSON 示例](examples/collection.json)
+
+## AI 与 MCP
+
+- **在星栈内询问**。选择「AI 推荐」，或运行 `starstack ask '帮我从收藏里挑个 CLI 库'`。Aimux 默认调用本机 Ollama。切换到远端服务时，问题和最多五个候选仓库的名称、描述及语言会发送给那个 provider，回答中的编号对应返回的仓库链接。[模型配置](docs/deploy.md)
+- **在 AI 助手里询问**。Claude Desktop 可通过 stdio 启动星栈。多用户服务提供 `/mcp`，支持在后台签发、撤销按用户隔离的 Bearer token。助手申请同步后，由用户在星栈中确认。[接入步骤](docs/mcp.md) · [Claude Desktop 示例](examples/claude_desktop_config.json)
+
+## 同步和恢复
+
+| 场景 | 行为与操作 |
+| --- | --- |
+| 首次导入大库 | `starstack sync --catalog-only` 遍历 Stars 分页，保存仓库目录和 GitHub 分类，可直接浏览。运行 `starstack index` 可先用已有文本检索。之后的 `--catalog-only` 使用增量游标，添加 `--full` 可重新读取全部分页。 |
+| 日常新增 | `starstack sync` 从最近收藏开始增量拉取，同一时间戳的记录一起核对。 |
+| 旧仓库改名、说明更新、unstar | `starstack sync --full` 或后台定时任务完整核对。取消收藏后从列表和检索中移除；重新 star 会找回本地批注。 |
+| 定时刷新 | 仅在 Web 服务运行时执行。默认每 360 分钟全量核对目录。后台 README 任务默认每 30 分钟消费一批待处理仓库，再更新变化的向量。两个周期均可按用户调整，设为 0 可关闭对应任务。 |
+| 换模型或索引受损 | 设置 `STARSTACK_MODEL` 并拉取对应模型，运行 `starstack index --rebuild`。批注保存在 SQLite。 |
+| GitHub 限流或 token 失效 | 星栈按账户分别记录 REST 和 GraphQL 响应中的额度窗口。默认预留 5% 配额，每轮 README 最多 200 次请求。若触及预留值，目录仍可使用剩余额度；耗尽或收到限流后遵守重置时间。目录分页不完整时保留原有成员和游标。 |
+| Ollama 未启动 | 同步的元数据已保存。启动 Ollama，确认模型已下载，然后运行 `starstack index`。 |
+| 搬家、备份 | 停止服务及其他写入进程，备份整个 `STARSTACK_HOME`。其中包括设备授权凭证，请保护备份。 |
+
+README 抓取失败时，已入库的目录、上一版 README 和私人批注仍可用，待处理队列下轮继续。CLI 的 `sync` 会在前台完成一批；Web 服务可异步补全。在「同步与索引」中可按用户调整预算与预留比例。需要用本机 Firecrawl 解析公开项目页面时，使用 `cargo build --release --locked --features firecrawl-local` 构建，或运行 `STARSTACK_FEATURES=firecrawl-local docker compose up -d --build`。官方发布流程使用基础构建。可选的 `firecrawl-local` crate 使用 AGPL-3.0 许可。[部署与抓取方式](docs/deploy.md) · [Firecrawl Local](https://crates.io/crates/firecrawl-local/0.1.1)
+
+数据库使用 Diesel ORM 与 SQLite。用户 ID 和 GitHub 稳定仓库 ID 一起标识收藏，向量缓存的指纹覆盖模型和语义内容。HawDB 投影按代发布，库内保存当前代号；搜索先限制到当前用户和筛选条件，再做向量排序。[部署与存储位置](docs/deploy.md)
+
+## 界面截图
+
+截图来自独立的示例收藏库。仓库名称对应公开项目，Star 数量、收藏日期、标签和备注均为演示数据。点击图片可查看原图。
+
+### 桌面 · 1440 × 900
+
+#### 浅色
+
+| 收藏库 | 仓库详情 | 收藏统计 |
+| --- | --- | --- |
+| [![桌面 · 浅色 · 收藏库](docs/screenshots/zh-desktop-light-library.webp)](docs/screenshots/zh-desktop-light-library.webp) | [![桌面 · 浅色 · 仓库详情](docs/screenshots/zh-desktop-light-detail.webp)](docs/screenshots/zh-desktop-light-detail.webp) | [![桌面 · 浅色 · 收藏统计](docs/screenshots/zh-desktop-light-statistics.webp)](docs/screenshots/zh-desktop-light-statistics.webp) |
+
+#### 深色
+
+| 收藏库 | 仓库详情 | 收藏统计 |
+| --- | --- | --- |
+| [![桌面 · 深色 · 收藏库](docs/screenshots/zh-desktop-dark-library.webp)](docs/screenshots/zh-desktop-dark-library.webp) | [![桌面 · 深色 · 仓库详情](docs/screenshots/zh-desktop-dark-detail.webp)](docs/screenshots/zh-desktop-dark-detail.webp) | [![桌面 · 深色 · 收藏统计](docs/screenshots/zh-desktop-dark-statistics.webp)](docs/screenshots/zh-desktop-dark-statistics.webp) |
+
+
+### 手机 · 390 × 844
+
+#### 浅色
+
+| 收藏库 | 仓库详情 | 收藏统计 |
+| --- | --- | --- |
+| [![手机 · 浅色 · 收藏库](docs/screenshots/zh-mobile-light-library.webp)](docs/screenshots/zh-mobile-light-library.webp) | [![手机 · 浅色 · 仓库详情](docs/screenshots/zh-mobile-light-detail.webp)](docs/screenshots/zh-mobile-light-detail.webp) | [![手机 · 浅色 · 收藏统计](docs/screenshots/zh-mobile-light-statistics.webp)](docs/screenshots/zh-mobile-light-statistics.webp) |
+
+#### 深色
+
+| 收藏库 | 仓库详情 | 收藏统计 |
+| --- | --- | --- |
+| [![手机 · 深色 · 收藏库](docs/screenshots/zh-mobile-dark-library.webp)](docs/screenshots/zh-mobile-dark-library.webp) | [![手机 · 深色 · 仓库详情](docs/screenshots/zh-mobile-dark-detail.webp)](docs/screenshots/zh-mobile-dark-detail.webp) | [![手机 · 深色 · 收藏统计](docs/screenshots/zh-mobile-dark-statistics.webp)](docs/screenshots/zh-mobile-dark-statistics.webp) |
