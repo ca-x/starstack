@@ -6,8 +6,8 @@ export interface Chunking {
   preset: "balanced" | "short" | "long" | "whole";
 }
 
-export function ChunkingSettings({ current, backend, disabled, save }: {
-  current: Chunking; backend: string; disabled: boolean; save: (settings: Chunking) => Promise<boolean>;
+export function ChunkingSettings({ current, disabled, save }: {
+  current: Chunking; disabled: boolean; save: (settings: Chunking) => Promise<boolean>;
 }) {
   const [draft, setDraft] = useState<Chunking["preset"]>();
   const preset = draft ?? current.preset;
@@ -19,7 +19,7 @@ export function ChunkingSettings({ current, backend, disabled, save }: {
   }
 
   return <form className="model-selector" onSubmit={submit}>
-    <EuiFormRow label={t("分块预设")} helpText={t("用于当前账号的 {0} 后端。", backend)} fullWidth>
+    <EuiFormRow label={t("分块预设")} helpText={t("调整当前账号发送给 Ollama 的每个文本块的长度。")} fullWidth>
       <EuiSelect fullWidth value={preset} disabled={disabled} onChange={e => setDraft(e.target.value as Chunking["preset"])}
         options={[{ value: "balanced", text: t("均衡（推荐）") }, { value: "short", text: t("短分块") },
           { value: "long", text: t("长分块") }, { value: "whole", text: t("整篇（兼容）") }]} />

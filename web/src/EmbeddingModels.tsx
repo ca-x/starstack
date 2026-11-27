@@ -168,7 +168,8 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active
           }))}
           onChange={event => { void change("index-profile", { profile: event.target.value }); }} />
       </EuiFormRow>}
-      {catalog.chunking && <ChunkingSettings key={catalog.backend} current={catalog.chunking} backend={catalog.backend === "ollama" ? "Ollama" : t("内置")}
+      {catalog.backend === "builtin" && <p>{t("内置模型使用自带的分词器自动分块，长文本会分成多个重叠窗口。")}</p>}
+      {catalog.backend === "ollama" && catalog.chunking && <ChunkingSettings current={catalog.chunking}
         disabled={busy || jobActive} save={settings => change("chunking", settings)} />}
       {chunkFeedback && feedback}
     </>}

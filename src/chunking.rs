@@ -7,10 +7,19 @@ use serde::{Deserialize, Serialize};
 #[serde(tag = "mode", rename_all = "snake_case", deny_unknown_fields)]
 pub(crate) enum Policy {
     WholeDocument,
-    Window { size: usize, overlap: usize },
+    Structured {
+        body_cap: usize,
+        alpha: u8,
+        window: Option<(usize, usize)>,
+    },
+    Window {
+        size: usize,
+        overlap: usize,
+    },
 }
 
 impl Policy {
+    #[cfg(test)]
     pub(crate) fn whole_document() -> Self {
         Self::WholeDocument
     }
@@ -22,6 +31,16 @@ impl Policy {
     pub(crate) fn identity(&self) -> String {
         match self {
             Self::WholeDocument => "whole-document".into(),
+            Self::Structured {
+                body_cap,
+                alpha,
+                window,
+            } => match window {
+                Some((size, overlap)) => {
+                    format!("structured-v1-{body_cap}-{alpha}-{size}-{overlap}")
+                }
+                None => format!("structured-v1-{body_cap}-{alpha}"),
+            },
             Self::Window { size, overlap } => format!("unicode-window-v1-{size}-{overlap}"),
         }
     }
@@ -37,8 +56,13 @@ impl Policy {
     }
 
     pub(crate) fn split(&self, text: &str) -> Vec<String> {
-        let &Self::Window { size, overlap } = self else {
-            return vec![text.to_owned()];
+        let (size, overlap) = match *self {
+            Self::Window { size, overlap }
+            | Self::Structured {
+                window: Some((size, overlap)),
+                ..
+            } => (size, overlap),
+            _ => return vec![text.to_owned()],
         };
         let boundaries: Vec<_> = text
             .char_indices()
@@ -59,20 +83,38 @@ impl Policy {
     }
 }
 
+fn configured(db: &mut Db, backend: &str) -> Result<Option<Policy>> {
+    store::meta(db, &format!("chunking_policy:{backend}"))?
+        .map(|value| {
+            let policy: Policy = serde_json::from_str(&value)?;
+            policy.validate()?;
+            Ok(policy)
+        })
+        .transpose()
+}
+
 pub(crate) fn selected(db: &mut Db, backend: &str) -> Result<Policy> {
-    if let Some(value) = store::meta(db, &format!("chunking_policy:{backend}"))? {
-        let policy: Policy = serde_json::from_str(&value)?;
-        policy.validate()?;
-        return Ok(policy);
-    }
-    if backend == "ollama"
-        && store::meta(db, "index_model")?.is_some()
-        && store::meta(db, "index_chunk_policy")?.is_none_or(|s| s == "whole-document")
-        && store::meta(db, "index_backend")?.is_none_or(|s| s == "ollama")
-    {
-        return Ok(Policy::whole_document());
-    }
-    Ok(Preset::Balanced.policy())
+    let configured = configured(db, backend)?;
+    let body_cap = match std::env::var("STARSTACK_README_INDEX_CHARS") {
+        Ok(value) => value
+            .parse::<usize>()
+            .map_err(|_| anyhow::anyhow!("STARSTACK_README_INDEX_CHARS 应为 0 至 65536"))?,
+        Err(std::env::VarError::NotPresent) => 4000,
+        Err(error) => return Err(error.into()),
+    };
+    ensure!(
+        body_cap <= 65536,
+        "STARSTACK_README_INDEX_CHARS 应为 0 至 65536"
+    );
+    let window = match configured.unwrap_or_else(|| Preset::Balanced.policy()) {
+        Policy::Window { size, overlap } if backend == "ollama" => Some((size, overlap)),
+        _ => None,
+    };
+    Ok(Policy::Structured {
+        body_cap,
+        alpha: 50,
+        window,
+    })
 }
 
 #[derive(Clone, Copy, Deserialize, Serialize)]
@@ -110,7 +152,7 @@ pub(crate) struct Parameters {
 }
 
 pub(crate) fn parameters(db: &mut Db, backend: &str) -> Result<Parameters> {
-    let policy = selected(db, backend)?;
+    let policy = configured(db, backend)?.unwrap_or_else(|| Preset::Balanced.policy());
     let preset = [Preset::Balanced, Preset::Short, Preset::Long, Preset::Whole]
         .into_iter()
         .find(|p| p.policy() == policy)

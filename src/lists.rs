@@ -274,7 +274,7 @@ impl GitHub<'_> {
     }
 }
 
-fn endpoint(rest: &str) -> Result<Url> {
+pub(crate) fn endpoint(rest: &str) -> Result<Url> {
     let mut url = Url::parse(rest).context("无效的 GitHub API 地址")?;
     ensure!(
         matches!(url.scheme(), "http" | "https")

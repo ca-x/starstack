@@ -16,6 +16,9 @@ pub(crate) const PRIMARY: &str = "primary";
 diesel::table! { repositories (owner_id, id) {
     owner_id -> Text, id -> BigInt, metadata -> Text, tags -> Text, note -> Text, pinned -> Bool, active -> Bool, summary -> Text, code_context -> Text, commit_index -> Text,
 }}
+diesel::table! { repository_fts (rowid) {
+    rowid -> BigInt, owner -> Text, repo_id -> BigInt, name -> Text, body -> Text,
+}}
 diesel::table! { metadata_values (owner_id, key) {owner_id -> Text, key -> Text, value -> Text,}}
 diesel::table! { current_library (owner_id) { owner_id -> Text, directory -> Text, }}
 
@@ -66,10 +69,10 @@ pub(crate) fn connect_as(dir: &Path, user: &str) -> Result<Db> {
         .get_result::<SchemaVersion>(&mut conn)?
         .user_version;
     ensure!(
-        (0..=3).contains(&version),
+        (0..=4).contains(&version),
         "数据库版本 {version} 高于此程序支持的版本，请使用较新的星栈"
     );
-    if version < 3 {
+    if version < 4 {
         conn.immediate_transaction::<_, diesel::result::Error, _>(|db| {
             let version = diesel::sql_query("PRAGMA user_version").get_result::<SchemaVersion>(db)?.user_version;
             if version == 0 { db.batch_execute(include_str!("schema.sql"))?; }
@@ -81,6 +84,7 @@ pub(crate) fn connect_as(dir: &Path, user: &str) -> Result<Db> {
                 db.batch_execute(include_str!("commits_schema.sql"))?;
                 db.batch_execute("ALTER TABLE repositories ADD COLUMN summary TEXT NOT NULL DEFAULT ''; ALTER TABLE repositories ADD COLUMN code_context TEXT NOT NULL DEFAULT ''; ALTER TABLE repositories ADD COLUMN commit_index TEXT NOT NULL DEFAULT ''; PRAGMA user_version=3")?;
             }
+            if version < 4 { db.batch_execute(include_str!("search_schema.sql"))?; }
             Ok(())
         })?;
     }
@@ -144,7 +148,7 @@ pub(crate) struct Repo {
     pub score: Option<f32>,
 }
 
-#[derive(Debug, Default, Clone, clap::Args, Deserialize, schemars::JsonSchema)]
+#[derive(Debug, Default, Clone, PartialEq, clap::Args, Deserialize, schemars::JsonSchema)]
 pub(crate) struct Filter {
     /// Primary programming language, e.g. Rust
     #[arg(long)]
@@ -517,50 +521,113 @@ pub(crate) fn keyword_search(
     filter: &Filter,
     limit: usize,
 ) -> Result<Vec<Repo>> {
-    use diesel::{dsl::sql, sql_types::Text};
-    use repositories as r;
-    let terms: Vec<_> = query
+    use diesel::sql_types::{BigInt, Text};
+
+    let words: Vec<_> = query
         .split(|c: char| !c.is_alphanumeric() && !"+#_-".contains(c))
-        .filter(|term| !term.is_empty())
+        .filter(|word| !word.is_empty())
         .take(12)
-        .map(str::to_lowercase)
         .collect();
-    if terms.is_empty() {
+    if words.is_empty() || limit == 0 {
         return Ok(Vec::new());
     }
-    let phrase = query.trim().to_lowercase();
-    db.transaction(|db| {
-        let user = owner(db)?;
-        let (name, text) = (
-            sql::<Text>("COALESCE(json_extract(metadata,'$.full_name'), '')"),
-            sql::<Text>(
-                "printf('%s %s %s %s %s %s',
-                json_extract(metadata,'$.description'), json_extract(metadata,'$.language'),
-                json_extract(metadata,'$.topics'), tags, note, summary)",
-            ),
-        );
-        let mut matches = Vec::new();
-        for row in eligible(user, filter)
-            .select((r::id, name, text))
-            .load_iter::<(i64, String, String), _>(db)?
-        {
-            let (id, name, text) = row?;
-            let (name, text) = (name.to_lowercase(), text.to_lowercase());
-            let mut score = usize::from(name.contains(&phrase)) * 4;
-            for term in &terms {
-                score += 3 * usize::from(name.contains(term)) + usize::from(text.contains(term));
-            }
-            if score > 0 {
-                matches.push((std::cmp::Reverse(score), id));
+    let mut terms = Vec::new();
+    let mut has_short_word = false;
+    for &word in &words {
+        if word.chars().count() < 3 {
+            has_short_word = true;
+        } else if word.starts_with(|c: char| c.is_ascii()) {
+            terms.push(format!(r#""{word}""#));
+        } else {
+            let chars: Vec<_> = word.chars().collect();
+            for window in chars.windows(3).take(16) {
+                let token: String = window.iter().collect();
+                terms.push(format!(r#""{token}""#));
             }
         }
-        matches.sort_unstable();
-        matches
-            .into_iter()
-            .take(limit)
-            .map(|(_, id)| by_id(db, id))
-            .collect()
+    }
+    terms.sort_unstable();
+    terms.dedup();
+    terms.truncate(64);
+    #[derive(QueryableByName)]
+    struct Hit {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+    }
+    db.transaction(|db| {
+        let user = owner(db)?;
+        let allowed = if *filter == Filter::default() {
+            None
+        } else {
+            Some(eligible(user.clone(), filter).select(repositories::id).load::<i64>(db)?
+                .into_iter().collect::<BTreeSet<_>>())
+        };
+        let is_allowed = |id: i64| allowed.as_ref().is_none_or(|ids| ids.contains(&id));
+        if terms.is_empty() {
+            return short_keyword_search(db, &user, query, &words, limit, is_allowed);
+        }
+        let hits = diesel::sql_query(
+            "SELECT repo_id AS id FROM repository_fts
+             WHERE repository_fts MATCH ? AND owner=?
+             ORDER BY CASE WHEN name=? COLLATE NOCASE THEN 0 WHEN instr(lower(name),lower(?))>0 THEN 1 ELSE 2 END,
+                      bm25(repository_fts,0,0,6,1), repo_id",
+        )
+        .bind::<Text, _>(terms.join(" OR "))
+        .bind::<Text, _>(&user)
+        .bind::<Text, _>(query.trim())
+        .bind::<Text, _>(query.trim())
+        .load_iter::<Hit, _>(db)?
+        .filter_map(|row| match row {
+            Ok(hit) if is_allowed(hit.id) => Some(Ok(hit.id)),
+            Ok(_) => None,
+            Err(error) => Some(Err(error)),
+        })
+        .take(limit).collect::<diesel::QueryResult<Vec<_>>>()?;
+        if hits.is_empty() && has_short_word {
+            return short_keyword_search(db, &user, query, &words, limit, is_allowed);
+        }
+        hits.into_iter().map(|id| by_id(db, id)).collect()
     })
+}
+
+fn short_keyword_search(
+    db: &mut Db,
+    user: &str,
+    query: &str,
+    words: &[&str],
+    limit: usize,
+    is_allowed: impl Fn(i64) -> bool,
+) -> Result<Vec<Repo>> {
+    use repository_fts as f;
+    let terms: Vec<_> = words.iter().map(|word| word.to_lowercase()).collect();
+    let phrase = query.trim().to_lowercase();
+    // Trigrams cannot match one- or two-character words. Scan the compact keyword
+    // documents, which exclude README content, for these queries.
+    let mut matches = Vec::new();
+    for row in f::table
+        .filter(f::owner.eq(user))
+        .select((f::repo_id, f::name, f::body))
+        .load_iter::<(i64, String, String), _>(db)?
+    {
+        let (id, name, text) = row?;
+        if !is_allowed(id) {
+            continue;
+        }
+        let (name, text) = (name.to_lowercase(), text.to_lowercase());
+        let mut score = usize::from(name.contains(&phrase)) * 4;
+        for term in &terms {
+            score += 3 * usize::from(name.contains(term)) + usize::from(text.contains(term));
+        }
+        if score > 0 {
+            matches.push((std::cmp::Reverse(score), id));
+        }
+    }
+    matches.sort_unstable();
+    matches
+        .into_iter()
+        .take(limit)
+        .map(|(_, id)| by_id(db, id))
+        .collect()
 }
 
 fn ordered<'a>(

@@ -405,6 +405,7 @@ struct Settings {
     readme_interval_minutes: Option<u64>,
     quota_reserve_percent: Option<u8>,
     readme_budget: Option<usize>,
+    initial_readme_boost: Option<bool>,
     readme_source: Option<crate::quota::ReadmeSource>,
     retry_sync: Option<bool>,
     retry_readme: Option<bool>,
@@ -503,7 +504,7 @@ fn settings(db: &mut store::Db) -> Result<Value> {
     let p = Policy::load(db)?;
     Ok(json!({"sync_interval_minutes":library::interval(db)?,
         "readme_interval_minutes":quota::readme_interval(db)?,"pending_sync":store::meta(db,"pending_sync")?,
-        "quota_reserve_percent":p.reserve_percent,"readme_budget":p.readme_budget,"readme_source":p.readme_source,
+        "quota_reserve_percent":p.reserve_percent,"readme_budget":p.readme_budget,"readme_source":p.readme_source,"initial_readme_boost":p.initial_readme_boost,
         "retry_sync":crate::retry::enabled(db,"sync")?,
         "retry_readme":crate::retry::enabled(db,"readme")?,
         "retry_organize":crate::retry::enabled(db,"organize")?,
@@ -880,6 +881,7 @@ async fn write(
                 let mut p=crate::quota::Policy::load(db)?;
                 if let Some(n)=q.quota_reserve_percent{p.reserve_percent=n;}
                 if let Some(n)=q.readme_budget{p.readme_budget=n;}
+                if let Some(enabled)=q.initial_readme_boost{p.initial_readme_boost=enabled;}
                 if let Some(source)=q.readme_source{p.readme_source=source;}
                 p.save(db)?;
                 for (task, enabled) in [("sync",q.retry_sync),("readme",q.retry_readme),("organize",q.retry_organize)] {

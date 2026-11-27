@@ -50,21 +50,31 @@ impl Query {
     }
 }
 pub(crate) fn search(db: &mut Db, q: &Query) -> Result<Vec<Repo>> {
-    q.validate()?;
-    let limit = q.limit.unwrap_or(10);
-    match index::search(db, &q.query, &q.filter, limit) {
+    match search_published(db, q) {
         Err(error) if error.is::<index::Stale>() => {
             index::build(db, false, &|_| {})?;
-            index::search(db, &q.query, &q.filter, limit)
+            search_published(db, q)
         }
         result => result,
     }
 }
+
+pub(crate) fn search_published(db: &mut Db, q: &Query) -> Result<Vec<Repo>> {
+    q.validate()?;
+    index::hybrid_search(
+        db,
+        &q.query,
+        &q.filter,
+        q.limit.unwrap_or(10),
+        std::time::Duration::from_secs(180),
+    )
+}
+
 pub(crate) fn interactive_search(db: &mut Db, q: &Query) -> Result<(Vec<Repo>, bool)> {
     q.validate()?;
     let limit = q.limit.unwrap_or(10);
     if index::has_published_generation(db).unwrap_or(false)
-        && let Ok(rows) = index::search_with_timeout(
+        && let Ok(rows) = index::hybrid_search(
             db,
             &q.query,
             &q.filter,
@@ -74,7 +84,25 @@ pub(crate) fn interactive_search(db: &mut Db, q: &Query) -> Result<(Vec<Repo>, b
     {
         return Ok((rows, false));
     }
-    Ok((store::keyword_search(db, &q.query, &q.filter, limit)?, true))
+    let filter = index::inferred_filter(&q.query, &q.filter, chrono::Utc::now().date_naive());
+    Ok((store::keyword_search(db, &q.query, &filter, limit)?, true))
+}
+
+pub(crate) fn fuse(semantic: Vec<Repo>, keywords: Vec<Repo>, limit: usize) -> Vec<Repo> {
+    let mut ranks = std::collections::BTreeMap::<i64, (f64, Repo)>::new();
+    for list in [semantic, keywords] {
+        for (rank, repository) in list.into_iter().enumerate() {
+            let entry = ranks.entry(repository.id).or_insert((0.0, repository));
+            entry.0 += 1.0 / (61 + rank) as f64;
+        }
+    }
+    let mut ordered: Vec<_> = ranks.into_values().collect();
+    ordered.sort_unstable_by(|(left, a), (right, b)| right.total_cmp(left).then(a.id.cmp(&b.id)));
+    ordered
+        .into_iter()
+        .take(limit)
+        .map(|(_, repo)| repo)
+        .collect()
 }
 
 /// Keep long READMEs in the collection; cards and AI sources only need their metadata.

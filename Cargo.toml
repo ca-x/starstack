@@ -1,6 +1,6 @@
 [package]
 name = "starstack"
-version = "0.2.7"
+version = "0.2.8"
 edition = "2024"
 rust-version = "1.97.1"
 license = "Apache-2.0"
@@ -9,7 +9,7 @@ repository = "https://github.com/ca-x/starstack"
 
 [features]
 default = ["firecrawl-local"]
-firecrawl-local = ["dep:firecrawl-local", "dep:kuchikiki", "dep:futures"]
+firecrawl-local = ["dep:firecrawl-local", "dep:futures"]
 
 [dependencies]
 candle-core = "0.11.1"
@@ -17,7 +17,7 @@ candle-nn = "0.11.1"
 candle-transformers = "0.11.1"
 tokenizers = { version = "0.23.2", default-features = false, features = ["fancy-regex"] }
 firecrawl-local = { version = "0.1.1", optional = true }
-kuchikiki = { version = "0.8.9-speedreader", optional = true }
+kuchikiki = "0.8.9-speedreader"
 futures = { version = "0.3", optional = true }
 aimux-core = "0.7.0"
 aimux-providers = { version = "0.7.0", default-features = false }
@@ -46,6 +46,9 @@ backoff = "0.4.0"
 # HawDB 0.40 qualifies the Zstd 1.5.7 ABI. Keep the matching zstd dependencies in Cargo.lock.
 hawdb-storage = "=0.40.0"
 hawdb-integrity = "=0.40.0"
+pulldown-cmark = { version = "0.13.6", default-features = false, features = ["html"] }
 
 [profile.release]
 strip = true
+lto = "thin"
+codegen-units = 1

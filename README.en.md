@@ -88,7 +88,26 @@ starstack index --rebuild
 
 The catalog also includes native Qwen3-Embedding-0.6B Q4_K_M (about 387 MiB). Run `starstack models download qwen3-embedding-0.6b-q4-k-m --source modelscope`, then `starstack models select builtin --model qwen3-embedding-0.6b-q4-k-m`. Administrators can also search the model hubs or upload files offline. Both catalog models have pinned SHA-256 digests. Custom imports support 384-dimensional, mean-pooled Sentence Transformers BERT models with a single safetensors weight file.
 
-Under **Chunking preset**, choose balanced, short, long or whole-document mode for the current account and backend. New libraries use balanced chunks of 512 characters with a 64-character overlap. Existing Ollama indexes keep their whole-document setting. After changing the model or chunk settings, select **Rebuild index** in that account.
+Built-in models use their bundled tokenizer to split long inputs into overlapping windows automatically. With Ollama, **Semantic index → Chunking preset** sets the size of each text chunk sent to your account’s Ollama server. Accounts without a saved Ollama preset use Balanced. The whole-document preset sends each metadata or body section as one input.
+
+For Ollama indexing, `STARSTACK_OLLAMA_BATCH_SIZE` sets the number of inputs per request (default 64, range 1–128), and `STARSTACK_OLLAMA_CONCURRENCY` sets the maximum simultaneous requests (default 2, range 1–4). The inference timer includes network time. The built-in model runs in-process.
+
+StarStack embeds the repository metadata and private annotations separately from the cleaned README, saved code excerpts and commit text. It combines the two parts into one repository vector and can reuse the unchanged part on later updates. The instance setting `STARSTACK_README_INDEX_CHARS` limits the cleaned README to 4,000 Unicode characters by default. Set it to `0` to omit the README from the embedding input, or to a value up to `65536`. README fetching and storage have their own settings.
+
+On a first structured index build with repository text available, StarStack publishes searchable metadata first. It then processes repository text, starting with pinned and recently starred repositories. **Semantic index** shows when the text index is pending.
+
+After upgrading an index built with the earlier text layout or changing its model, chunking or README limit, choose **Rebuild index** in each affected account. Use `starstack index --rebuild` for the initial administrator’s library. Search combines semantic and keyword rankings. Exact project names can surface through keyword matching even when their semantic similarity is low.
+
+### Evaluate search on your own stars
+
+Put one JSON object per line in `queries.jsonl`. Use questions representative of your searches, with one or more expected repositories already in your library.
+
+```jsonl
+{"query":"search for text in a directory tree","expect":["BurntSushi/ripgrep"]}
+{"query":"interactive command-line fuzzy finder","expect":["junegunn/fzf"]}
+```
+
+Run `starstack eval --queries queries.jsonl` against the published index. It reports mean Recall@5, MRR@100, and p50/p95 query latency in milliseconds. Compare runs on the same collection and queries after rebuilding each configuration.
 
 ## GitHub Star Lists
 
@@ -148,6 +167,8 @@ In **MCP access → Search and recommendations**, you can opt into AI query expa
 - The semantic index includes the repository name, description, language, topics, license, README and private annotations. For the initial library, run `starstack index --rebuild` after changing the model or chunk settings, or to recover a damaged index.
 - StarStack tracks REST and GraphQL rate windows separately for each upstream account. The default policy reserves 5% of the allowance and budgets 200 README requests per run. Catalog requests can use the reserve. A rate-limited or failed README stays in the queue, preserving the previous text and private annotations. Follow the retry time in the summary. Reauthorize an expired credential. If the search model is unavailable, synced metadata stays in the library. Finish the built-in model download or restore the selected Ollama service, then run `starstack index`.
 - Stop writers before backing up the entire `STARSTACK_HOME`. SQLite stores account, library, and index metadata. HawDB stores full-precision vectors and checkpoints in its immutable object store, plus a quantized search projection. Upgrades migrate existing SQLite embeddings and checkpoints without recomputing valid vectors. The backup should include SQLite, the HawDB projections and vector object directories, and the GitHub device credential. Keep the backup private.
+
+In **Sync & index → Schedule & quotas**, enable **Speed up the first README backfill** to use spare quota reported by GitHub during the initial import. It can raise a positive per-run request budget to 1,000, keeps any higher configured budget, and returns to the configured budget when the queue first empties. The GitHub source can fetch up to three public root READMEs in a single GraphQL request. Missing or unsuitable results use REST. A failed Firecrawl fetch also falls back to authenticated REST as quota allows.
 
 The CLI processes one README batch in the foreground. Dashboard users can set their own batch budget, reserve and fetch method. Releases include Firecrawl Local. Each account can use the GitHub API or select Firecrawl Local to parse public repository pages locally. Private repositories and repositories with unknown visibility use the GitHub REST API. Firecrawl Local uses the AGPL-3.0 license. [Deployment](docs/deploy.md) · [Firecrawl Local](https://crates.io/crates/firecrawl-local/0.1.1)
 

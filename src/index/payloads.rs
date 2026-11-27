@@ -59,6 +59,10 @@ impl Payloads {
         .concat()
     }
 
+    pub(super) fn object_path(&mut self, metadata: &[u8]) -> Result<PathBuf> {
+        Ok(self.open()?.object_path(Self::reference(metadata)?))
+    }
+
     pub(super) fn read(&mut self, legacy: Vec<u8>, metadata: &[u8]) -> Result<Vec<u8>> {
         if legacy.is_empty() {
             Ok(self.open()?.read(Self::reference(metadata)?)?)

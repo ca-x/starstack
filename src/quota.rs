@@ -53,11 +53,11 @@ impl Window {
         w.resource = Some(resource);
         Ok(w)
     }
-    pub fn observe(&mut self, headers: &HeaderMap) {
+    pub fn observe(&mut self, headers: &HeaderMap) -> bool {
         if let (Some(expected), Some(actual)) = (self.resource, headers.get("x-ratelimit-resource"))
             && actual != expected.name()
         {
-            return;
+            return false;
         }
         let number = |key: &str| headers.get(key)?.to_str().ok()?.parse::<u64>().ok();
         if let (Some(limit), Some(left), Some(reset)) = (
@@ -68,7 +68,9 @@ impl Window {
             self.limit = Some(limit);
             self.remaining = Some(left);
             self.reset_at = i64::try_from(reset).ok();
+            return self.reset_at.is_some();
         }
+        false
     }
     pub fn defer(&mut self, seconds: u64) {
         let until = Utc::now()
@@ -93,6 +95,15 @@ impl Window {
         );
         Ok(())
     }
+    pub fn observed_headroom(&self, percent: u8) -> Option<usize> {
+        let (limit, remaining, reset) = (self.limit?, self.remaining?, self.reset_at?);
+        if self.check().is_err() || reset <= Utc::now().timestamp() {
+            return None;
+        }
+        let reserve = limit.saturating_mul(u64::from(percent)).div_ceil(100);
+        Some(usize::try_from(remaining.saturating_sub(reserve)).unwrap_or(usize::MAX))
+    }
+
     pub fn has_headroom(&self, percent: u8) -> bool {
         if self.check().is_err() {
             return false;
@@ -147,6 +158,8 @@ pub(crate) struct Policy {
     pub reserve_percent: u8,
     pub readme_budget: usize,
     pub readme_source: ReadmeSource,
+    #[serde(default)]
+    pub initial_readme_boost: bool,
 }
 impl Default for Policy {
     fn default() -> Self {
@@ -154,6 +167,7 @@ impl Default for Policy {
             reserve_percent: 5,
             readme_budget: 200,
             readme_source: ReadmeSource::Github,
+            initial_readme_boost: false,
         }
     }
 }

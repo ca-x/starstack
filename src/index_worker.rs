@@ -46,6 +46,14 @@ impl Profile {
         Ok(match store::meta(db, PROFILE)?.as_deref() {
             Some("quiet") => Self::Quiet,
             Some("performance") => Self::Performance,
+            None if store::meta(db, "index_generation")?
+                .as_deref()
+                .unwrap_or("0")
+                == "0"
+                || store::meta(db, "index_body_pending")?.is_some() =>
+            {
+                Self::Performance
+            }
             _ => Self::Balanced,
         })
     }
@@ -211,6 +219,20 @@ pub(crate) fn run(data_dir: &Path, owner: &str, profile: Profile) -> Result<()> 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn first_generation_default_respects_explicit_preferences() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = store::connect(dir.path())?;
+        assert!(Profile::load(&mut db)? == Profile::Performance);
+        store::set_meta(&mut db, "index_generation", "1")?;
+        assert!(Profile::load(&mut db)? == Profile::Balanced);
+        store::set_meta(&mut db, PROFILE, "quiet")?;
+        assert!(Profile::load(&mut db)? == Profile::Quiet);
+        store::set_meta(&mut db, "index_generation", "0")?;
+        assert!(Profile::load(&mut db)? == Profile::Quiet);
+        Ok(())
+    }
 
     #[test]
     fn profile_respects_machine_capacity() {

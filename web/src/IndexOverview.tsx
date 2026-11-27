@@ -7,6 +7,7 @@ import { WaterLevel } from "./WaterLevel";
 
 interface Inventory {
   state: "unbuilt" | "pending" | "ready" | "needs_attention";
+  body_pending?: boolean;
   repositories: number;
   indexed: number;
   checkpoints: number;
@@ -63,6 +64,7 @@ export function IndexOverview({ visible, working, attention, modelBytes }: {
         <div><dt>{t("索引数据占用")}</dt><dd>{formatBytes(inventory.projection_bytes + inventory.vector_payload_bytes + inventory.legacy_payload_bytes)}</dd></div>
         {modelBytes !== undefined && <div><dt>{t("当前模型文件")}</dt><dd>{formatBytes(modelBytes)}</dd></div>}
       </dl>
+      {inventory.body_pending && <p role="status">{t("元数据已可检索，正文索引待补全。")}</p>}
       {!inventory.last_published_at && inventory.checkpoints > 0 &&
         <p>{t("已计算的向量已保存，可断点接续。首版索引发布后即可进行语义检索。")}</p>}
       <details className="index-storage-details"><summary>{t("查看索引占用明细")}</summary>

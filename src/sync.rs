@@ -17,6 +17,9 @@ use crate::store::{self, Change, Db, Repo};
 
 const GITHUB_API: &str = "https://api.github.com";
 const MAX_ATTEMPTS: u32 = 4;
+mod blobs;
+const INITIAL_READMES: &str = "initial_readme_backfill_v1";
+const REST_FALLBACK: &str = "pending_readme_rest_fallback_v1";
 const PENDING: &str = "pending_readme_ids_v1";
 const LAST_README_ATTEMPT: &str = "last_readme_attempt_id_v1";
 
@@ -254,6 +257,7 @@ struct GitHub<'a> {
 struct Requests<'a> {
     gh: &'a GitHub<'a>,
     quota: Window,
+    observed_this_run: bool,
     policy: QuotaPolicy,
     proxy: crate::proxy::ProxyConfig,
     budget_left: usize,
@@ -324,7 +328,7 @@ impl Requests<'_> {
                 )
                 .send();
             if let Ok(response) = &response {
-                self.quota.observe(response.headers());
+                self.observed_this_run |= self.quota.observe(response.headers());
             }
             let delay = match response {
                 Ok(r)
@@ -448,6 +452,7 @@ fn synchronize(
     let mut requests = Requests {
         gh,
         quota,
+        observed_this_run: false,
         proxy: crate::proxy::config(conn)?,
         budget_left: policy.readme_budget,
         policy,
@@ -540,6 +545,9 @@ fn synchronize_account(
     let user = store::owner(conn)?;
     conn.immediate_transaction::<_, anyhow::Error, _>(|db| {
         advance_revision(db, &mut revision)?;
+        if store::meta(db, "last_sync")?.is_none() {
+            store::set_meta(db, INITIAL_READMES, "1")?;
+        }
         for repo in repos.values_mut() {
             let saved = db.transaction::<_, anyhow::Error, _>(|tx| save_metadata(tx, &user, repo));
             match saved {
@@ -714,6 +722,10 @@ fn checkpoint(
     mode: Mode,
 ) -> Result<()> {
     summary.pending_readmes = pending.len();
+    if pending.is_empty() {
+        store::delete_meta(db, INITIAL_READMES)?;
+        store::delete_meta(db, REST_FALLBACK)?;
+    }
     store::set_meta(db, PENDING, &serde_json::to_string(pending)?)?;
     let key = if mode == Mode::PendingOnly {
         "last_readme_summary"
@@ -739,25 +751,61 @@ fn enrich_queue(
         let next = queue.partition_point(|id| *id <= last);
         queue.rotate_left(next);
     }
+    let initial = gh.policy.initial_readme_boost
+        && gh.observed_this_run
+        && gh.budget_left > 0
+        && store::meta(db, INITIAL_READMES)?.is_some();
+    let spare = gh.quota.observed_headroom(gh.policy.reserve_percent);
+    if initial && let Some(spare) = spare {
+        gh.budget_left = gh.budget_left.max(spare.min(1000));
+    }
+    let mut blob_enabled =
+        initial && spare.is_some_and(|n| n > 0) && gh.policy.readme_source == ReadmeSource::Github;
+    let mut fallback: BTreeSet<i64> = store::meta(db, REST_FALLBACK)?
+        .map(|raw| serde_json::from_str(&raw))
+        .transpose()?
+        .unwrap_or_default();
+    fallback.retain(|id| pending.contains(id));
     let mut exhausted = false;
-    for ids in queue.chunks(16) {
+    for ids in queue.chunks(if blob_enabled { 3 } else { 8 }) {
         let mut fetched = Vec::new();
         let mut public_batch = Vec::new();
         let mut last_attempt = None;
-        for &id in ids {
+        let repos = ids
+            .iter()
+            .map(|&id| store::by_id(db, id))
+            .collect::<Result<Vec<_>>>()?;
+        let mut blobs = if blob_enabled && gh.budget_left > 0 {
+            blobs::read(db, gh, &repos, &mut blob_enabled)?
+        } else {
+            BTreeMap::new()
+        };
+        let mut remaining = Vec::new();
+        for mut repo in repos {
+            let id = repo.id;
+            if let Some(text) = blobs.remove(&id) {
+                last_attempt = Some(id);
+                repo.readme = text;
+                fetched.push(repo);
+            } else {
+                remaining.push(repo);
+            }
+        }
+        for mut repo in remaining {
+            let id = repo.id;
             if gh.budget_left == 0 {
                 summary.readme_pause = Some("本轮 README 预算已用完，下次同步将继续补抓".into());
                 exhausted = true;
                 break;
             }
-            let mut repo = store::by_id(db, id)?;
             progress(&format!(
                 "正在读取 README，待处理 {}（{}）",
                 pending.len() - fetched.len() - public_batch.len(),
                 repo.full_name
             ));
             // The scraper reads github.com; enterprise repositories with the same name can differ.
-            let use_firecrawl = gh.policy.readme_source == ReadmeSource::Firecrawl
+            let use_firecrawl = !fallback.contains(&id)
+                && gh.policy.readme_source == ReadmeSource::Firecrawl
                 && repo.private == Some(false)
                 && repo
                     .html_url
@@ -803,12 +851,38 @@ fn enrich_queue(
                 "Firecrawl 返回的结果数量异常"
             );
             for (mut repo, result) in public_batch.into_iter().zip(results) {
+                let result = result.and_then(|text| {
+                    ensure!(!text.trim().is_empty(), "公开页面没有可识别的 README");
+                    Ok(text)
+                });
                 match result {
                     Ok(text) => {
                         repo.readme = text;
                         fetched.push(repo);
                     }
-                    Err(error) => summary.readme_failed(&repo.full_name, &error, progress),
+                    Err(error) => {
+                        fallback.insert(repo.id);
+                        if gh.budget_left == 0 || !gh.quota.has_headroom(gh.policy.reserve_percent)
+                        {
+                            summary.readme_failed(&repo.full_name, &error, progress);
+                            continue;
+                        }
+                        match readme(gh, &repo.full_name, progress) {
+                            Ok(text) => {
+                                repo.readme = text;
+                                fetched.push(repo);
+                            }
+                            Err(failure)
+                                if failure.is::<RateLimit>() || failure.is::<DeferredReadme>() =>
+                            {
+                                summary.remember_retry(&failure);
+                                summary.readme_pause = Some(format!("README 暂缓：{failure}"));
+                            }
+                            Err(failure) => {
+                                summary.readme_failed(&repo.full_name, &failure, progress)
+                            }
+                        }
+                    }
                 }
             }
         }
@@ -820,7 +894,13 @@ fn enrich_queue(
             for repo in fetched {
                 store::upsert(db, &repo)?;
                 pending.remove(&repo.id);
+                fallback.remove(&repo.id);
                 summary.readmes_fetched += 1;
+            }
+            if fallback.is_empty() {
+                store::delete_meta(db, REST_FALLBACK)?;
+            } else {
+                store::set_meta(db, REST_FALLBACK, &serde_json::to_string(&fallback)?)?;
             }
             if let Some(last) = last_attempt {
                 store::set_meta(db, LAST_README_ATTEMPT, &last.to_string())?;

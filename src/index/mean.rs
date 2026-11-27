@@ -8,6 +8,10 @@ pub(crate) struct Mean {
 
 impl Mean {
     pub(crate) fn push(&mut self, vector: &[f32]) -> Result<()> {
+        self.push_weighted(vector, 1.0)
+    }
+
+    pub(crate) fn push_weighted(&mut self, vector: &[f32], weight: f64) -> Result<()> {
         let norm = vector
             .iter()
             .map(|&x| f64::from(x).powi(2))
@@ -25,7 +29,7 @@ impl Mean {
             "模型返回的向量维度不一致，请检查模型并运行 starstack index --rebuild"
         );
         for (sum, &x) in self.sum.iter_mut().zip(vector) {
-            *sum += f64::from(x) / norm;
+            *sum += weight * f64::from(x) / norm;
         }
         Ok(())
     }

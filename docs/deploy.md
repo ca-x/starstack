@@ -49,7 +49,9 @@ stars.example.com {
 
 ### 选择 README 抓取方式
 
-发布的二进制和容器镜像内置 Firecrawl Local。每个账号可在「同步与索引」选择 GitHub API 或 Firecrawl Local。Firecrawl Local 读取公开仓库的 GitHub 页面并在本机提取 README，同时最多处理 4 个公开仓库。私有仓库和可见性未知的仓库使用带身份认证的 GitHub REST API。抓取失败时保留旧文本并记录重试。Firecrawl Local 使用 AGPL-3.0 许可，构建或分发时请核对上游条款。[Firecrawl Local crate](https://crates.io/crates/firecrawl-local/0.1.1) · [Firecrawl 上游](https://github.com/firecrawl/firecrawl)
+发布的二进制和容器镜像内置 Firecrawl Local。每个账号可在「同步与索引」选择 GitHub API 或 Firecrawl Local。Firecrawl Local 读取公开仓库的 GitHub 页面并在本机提取 README，同时最多处理 4 个公开仓库。私有仓库和可见性未知的仓库使用带身份认证的 GitHub REST API。Firecrawl 抓取失败后，星栈在预算和额度允许时尝试认证 REST；队列保留失败项供下轮继续。Firecrawl Local 使用 AGPL-3.0 许可，构建或分发时请核对上游条款。[Firecrawl Local crate](https://crates.io/crates/firecrawl-local/0.1.1) · [Firecrawl 上游](https://github.com/firecrawl/firecrawl)
+
+每个账号默认每轮使用 200 次 README 请求，预留 5% 的 GitHub 额度，后台补全间隔为 30 分钟。在「计划与额度」中将预算或补全间隔设为 0 可分别暂停抓取或暂停定时补全。「加速首次 README 补全」默认关闭。开启后，首次目录导入留下的队列可按 GitHub 实际返回的剩余 REST 额度提高预算，扣除预留后最多提高至 1000 次，原预算超过 1000 时沿用原值。队列首次清空即结束加速。GitHub 来源会在有余量时批量查询两至三个公开仓库的根目录 `README.md`，单独遵守 GraphQL 配额和冷却时间。缺失、过大、被截断或在 `.github/` 有优先 README 时，使用常规 REST 请求。每个 GraphQL 批次、REST 尝试和公开页面抓取各计一次本轮预算。GitHub 请求沿用当前代理设置。
 
 ## 二进制文件
 
@@ -84,12 +86,15 @@ macOS 可用 `shasum -a 256 文件名` 核对摘要，再用 `chmod +x 文件名
 | `STARSTACK_GITHUB_CLIENT_ID` | 使用 GitHub 设备授权登录时设置为已启用 Device Flow 的 GitHub OAuth App 的 Client ID。此流程无需 client secret。 |
 | `STARSTACK_GITHUB_SCOPE` | GitHub 设备授权请求的 OAuth scope，默认留空。需要访问私有仓库时可显式设为 `repo`。 |
 | `STARSTACK_PROXY_URL` | GitHub 请求及模型下载共用的出站代理，支持 HTTP、HTTPS、SOCKS5、SOCKS5h。非空值优先于管理后台配置。 |
+| `STARSTACK_README_INDEX_CHARS` | 每个仓库用于结构化向量索引的 README 正文上限，清理 Markdown 后按 Unicode 字符计数。默认 4000，允许 0 至 65536。0 跳过 README 正文。 |
 | `STARSTACK_README_INTERVAL_MINUTES` | 用户未保存自定义间隔时，后台补全待处理 README 的默认间隔，单位为分钟，默认 30，范围 0 至 10080。设为 0 暂停此后台任务。 |
 | `STARSTACK_SYNC_INTERVAL_MINUTES` | Web 服务后台同步的间隔，单位为分钟，默认 360。设为 0 可关闭定时同步。每轮核对完整收藏列表，并针对变更重新计算向量。 |
 | `GITHUB_TOKEN` 或 `GH_TOKEN` | 初始管理员用于 GitHub 同步的令牌，其他用户需分别授权。Compose 优先采用 `GITHUB_TOKEN`，其次采用 `GH_TOKEN`。 |
 | `STARSTACK_HF_ENDPOINT` | Hugging Face 下载源的根地址，默认 `https://huggingface.co`，可改为部署者信任的兼容镜像。 |
 | `STARSTACK_MODELSCOPE_ENDPOINT` | ModelScope 下载源的根地址，默认 `https://modelscope.cn`，可改为部署者信任的兼容镜像。 |
 | `STARSTACK_OLLAMA_DEFAULT_URL` | 管理员尚未保存地址列表时提供的 Ollama 地址。本机默认 `http://127.0.0.1:11434`，Compose 默认 `http://host.docker.internal:11434`。新库仍默认使用内置检索模型。 |
+| `STARSTACK_OLLAMA_BATCH_SIZE` | Ollama 嵌入请求的最大输入条数，默认 64，允许 1 至 128。 |
+| `STARSTACK_OLLAMA_CONCURRENCY` | Ollama 建索引时的最大并发请求数，默认 2，允许 1 至 4。界面的推理耗时包含网络往返。内置模型在进程内运行。 |
 | `STARSTACK_OLLAMA_URL` | 兼容旧部署。显式设置后，尚未选择后端的资料库默认使用 Ollama，此地址优先于 `STARSTACK_OLLAMA_DEFAULT_URL`。 |
 | `STARSTACK_MODEL` | Ollama 的默认嵌入模型名，默认为 `qwen3-embedding:0.6b`。显式设置也会让尚未选择后端的资料库默认使用 Ollama。 |
 | `STARSTACK_AI_PROVIDER` | Aimux 对话服务商 ID，例如 `ollama` 或 `openai`。默认尚未配置。 |
@@ -125,7 +130,30 @@ starstack index --rebuild
 
 容器内的 `127.0.0.1` 指向容器本身。使用宿主机 Ollama 时，选择 Compose 提供的 `http://host.docker.internal:11434`，并让 Ollama 监听容器可达的地址。若两个服务在同一 Compose 网络，可通过 `STARSTACK_OLLAMA_DEFAULT_URL=http://ollama:11434` 配置默认地址，其中 `ollama` 为服务名。已保存过地址列表的管理员可直接在界面中添加地址。
 
-**调整文本分块。** 在「语义索引」的「分块预设」中，为当前账号和当前后端选择预设。均衡模式每块 512 个 Unicode 字符，相邻块重叠 64 个字符。短分块为 192/24，长分块为 1024/128，整篇用于兼容旧索引。新库默认使用均衡模式，原有 Ollama 索引沿用整篇。更改后端、服务地址、模型或分块设置后，按页面提示在该账号下点击「重建索引」。本机 CLI 使用 `starstack index --rebuild` 重建初始库。
+**内置模型自动分块。** MiniLM 按分词器输出使用 128 token 窗口、24 token 重叠。Qwen 使用 512 token 窗口、64 token 重叠。超出单窗口的内容仍会参与编码。分词器和窗口参数随模型确定，界面中的 CPU 索引挡位仅控制计算资源。
+
+**Ollama 分块。** 在该账号的「语义索引 → 分块预设」中选择发送给远端服务的文本长度。均衡预设按 Unicode 字符划分，窗口长度为 512，相邻窗口重叠 64。短分块为 192/24，长分块为 1024/128，整篇模式让服务接收完整段落。尚未保存过预设时默认使用均衡，已保存的预设会沿用。模型服务自身的上下文长度仍然适用。
+
+**README 长度与重建。** 结构化索引将仓库元数据及私人批注作为一段，将清理后的 README、已保存的代码和提交说明作为另一段。两段均存在时各占一半权重，只有一段时使用该段。每仓发布一个向量，后续更新复用内容未变的段。`STARSTACK_README_INDEX_CHARS` 只限制进入正文段的 README 文本。填 0 仍可索引元数据、批注、已保存的代码和提交说明。
+
+库中有正文时，首次建立结构化索引会先发布元数据，随后补全 README、代码和提交说明。置顶仓库优先，同组按收藏时间从新到旧排列。正文阶段中断时，已发布的元数据仍可检索，索引状态会提示正文待补全。进度面板分别显示分词、推理和断点写入耗时，单位为毫秒。
+
+Compose 用户可在 `.env` 中设置上限，例如 `STARSTACK_README_INDEX_CHARS=8000`，然后运行 `docker compose up -d` 使新配置生效。直接运行二进制时，为服务和指向同一资料库的 CLI 使用相同的环境变量。变更模型、服务地址、分块或 README 上限后，在每个受影响账号的「语义索引」里重建。升级旧版索引时也请查看该页的重建提示，初始管理员可用以下命令完成重建。
+
+```bash
+docker compose exec starstack starstack index --rebuild
+```
+
+**结果排序。** 检索先按账号和筛选条件召回语义候选与关键词候选，再用倒数排名融合（RRF）合并两份结果。关键词索引通过 SQLite FTS5 查询仓库名、简介、语言、主题、许可证、私人标签、批注和已保存的总结。网页上的语义相似度来自向量检索，只命中关键词的结果没有该分数。语义索引尚未发布或服务不可用时，网页可以单独展示关键词结果。
+
+**验证检索效果。** 准备一个 JSON Lines 文件，每行使用 `{"query":"终端模糊查找","expect":["junegunn/fzf"]}` 的格式，预期结果应来自当前资料库。索引发布后，可将文件传入容器并运行评测。
+
+```bash
+docker compose cp queries.jsonl starstack:/tmp/queries.jsonl
+docker compose exec starstack starstack eval --queries /tmp/queries.jsonl
+```
+
+输出的 `recall_at_5` 是每个问题的预期仓库在前五名中被找回的比例，再对所有问题取平均。`mrr_at_100` 是首个命中的倒数排名均值，前一百名没有命中时记 0。`latency_p50_ms` 和 `latency_p95_ms` 给出查询耗时的中位数和第 95 百分位。
 
 ### 大收藏库、GitHub 分类与 README 配额
 

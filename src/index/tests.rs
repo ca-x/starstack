@@ -30,6 +30,21 @@ fn repo(id: i64, year: i32, description: &str, language: &str) -> Repo {
     }
 }
 
+// Give interruption and configuration-race fixtures deterministic request boundaries.
+fn build_small_batches(db: &mut Db, rebuild: bool, phase: &dyn Fn(&str)) -> Result<String> {
+    let rebuild = prepare_build(db, rebuild)?;
+    let mut engine = Engine::configured(db, Duration::from_secs(10))?;
+    let Runtime::Ollama(_, batches) = &mut engine.runtime else {
+        unreachable!()
+    };
+    *batches = RemoteBatches {
+        size: BATCH,
+        concurrent: 1,
+    };
+    let dir = store::data_dir(db)?;
+    build_observed_with(db, &dir, rebuild, &engine, phase, &|_| {})
+}
+
 #[test]
 fn index_progress_reports_new_and_reused_embeddings() -> Result<()> {
     let temp = tempfile::tempdir()?;
@@ -367,19 +382,19 @@ fn chunked_index_ranks_readme_suffix_reuses_vectors_and_rejects_changed_settings
     crate::ollama_settings::set(&mut db, Some(&server.url), Some("fixture"))?;
     set_backend(&mut db, "ollama")?;
     let mut a = repo(1, 2025, "library", "Rust");
-    a.readme = "installation and quickstart ".repeat(170);
+    a.readme = "installation and quickstart ".repeat(110);
     let mut b = a.clone();
     b.id = 2;
     b.full_name = "sample/photos".into();
     b.readme.push_str("Find and deduplicate photographs.");
     store::upsert(&mut db, &a)?;
     store::upsert(&mut db, &b)?;
-    build(&mut db, false, &|_| {})?;
+    build_small_batches(&mut db, false, &|_| {})?;
     assert!(!needs_rebuild(&mut db)?);
     let n = calls.load(Ordering::Relaxed);
     assert!(n > 2);
     assert_eq!(embeddings::table.count().get_result::<i64>(&mut db)?, 2);
-    build(&mut db, false, &|_| {})?;
+    build_small_batches(&mut db, false, &|_| {})?;
     assert_eq!(calls.load(Ordering::Relaxed), n);
     let ranks = search(&mut db, "photographs", &Filter::default(), 2)?;
     assert_eq!(ranks[0].id, b.id);
@@ -387,7 +402,7 @@ fn chunked_index_ranks_readme_suffix_reuses_vectors_and_rejects_changed_settings
 
     let generation_before = generation(&mut db)?;
     let writer = std::cell::RefCell::new(store::connect(home.path())?);
-    let err = build(&mut db, true, &|stage| {
+    let err = build_small_batches(&mut db, true, &|stage| {
         if stage.starts_with("正在写入") {
             crate::ollama_settings::set(&mut writer.borrow_mut(), Some(other_endpoint), None)
                 .unwrap();
@@ -463,20 +478,20 @@ fn changing_chunk_policy_during_inference_stops_the_next_batch_and_rejects_searc
     long.readme = "0123456789".repeat(420);
     store::upsert(&mut db, &long)?;
     save_policy(&mut db, "short")?;
-    build(&mut db, false, &|_| {})?;
+    build_small_batches(&mut db, false, &|_| {})?;
     let original_generation = generation(&mut db)?;
     let original_identity = store::meta(&mut db, "index_identity")?;
     assert!(count.load(Ordering::SeqCst) >= 2);
     count.store(0, Ordering::SeqCst);
     change.store(true, Ordering::SeqCst);
-    let err = build(&mut db, true, &|_| {}).unwrap_err();
+    let err = build_small_batches(&mut db, true, &|_| {}).unwrap_err();
     assert!(err.is::<BuildConflict>());
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(generation(&mut db)?, original_generation);
     assert_eq!(store::meta(&mut db, "index_identity")?, original_identity);
     assert!(needs_rebuild(&mut db)?);
     assert!(
-        build(&mut db, false, &|_| {})
+        build_small_batches(&mut db, false, &|_| {})
             .unwrap_err()
             .to_string()
             .contains("--rebuild")
@@ -489,7 +504,7 @@ fn changing_chunk_policy_during_inference_stops_the_next_batch_and_rejects_searc
             .unwrap_err()
             .is::<BuildConflict>()
     );
-    build(&mut db, true, &|_| {})?;
+    build_small_batches(&mut db, true, &|_| {})?;
     assert_ne!(store::meta(&mut db, "index_identity")?, original_identity);
     assert_eq!(
         search(&mut db, "fixture", &Filter::default(), 1)?[0].id,
@@ -499,7 +514,7 @@ fn changing_chunk_policy_during_inference_stops_the_next_batch_and_rejects_searc
 }
 
 #[test]
-fn existing_ollama_projection_and_raw_vector_survive_an_incremental_upgrade() -> Result<()> {
+fn old_ollama_index_requires_structured_rebuild_and_retains_searchable_annotations() -> Result<()> {
     let home = tempfile::tempdir()?;
     let mut db = store::connect(home.path())?;
     let owner = store::owner(&mut db)?;
@@ -509,6 +524,15 @@ fn existing_ollama_projection_and_raw_vector_survive_an_incremental_upgrade() ->
         .unwrap_or_else(|| "older-custom-embedding:v1".into());
     let item = repo(19, 2025, "legacy repository", "Rust");
     store::upsert(&mut db, &item)?;
+    let item = store::edit(
+        &mut db,
+        store::Edit {
+            id: item.id,
+            note: Some("archival fixture".into()),
+            pinned: Some(true),
+            ..Default::default()
+        },
+    )?;
     let blob: Vec<_> = [3.0_f32, 4.0]
         .into_iter()
         .flat_map(f32::to_le_bytes)
@@ -542,10 +566,26 @@ fn existing_ollama_projection_and_raw_vector_survive_an_incremental_upgrade() ->
     crate::ollama_settings::set_endpoints(&mut db, &[DEFAULT_OLLAMA_URL.into(), remote.into()])?;
     crate::ollama_settings::set(&mut db, Some(DEFAULT_OLLAMA_URL), None)?;
     assert_eq!(backend(&mut db)?, "ollama");
-    assert!(crate::chunking::selected(&mut db, "ollama")?.legacy());
-    assert!(!needs_rebuild(&mut db)?);
+    assert!(needs_rebuild(&mut db)?);
     let initial_file = fs::read(&path)?;
-    assert!(build(&mut db, false, &|_| {})?.contains("索引已是最新"));
+    assert!(
+        build(&mut db, false, &|_| {})
+            .unwrap_err()
+            .to_string()
+            .contains("--rebuild")
+    );
+    let query = crate::library::Query {
+        query: "archival".into(),
+        filter: Filter::default(),
+        limit: Some(1),
+    };
+    let (rows, keyword) = crate::library::interactive_search(&mut db, &query)?;
+    assert!(keyword);
+    assert_eq!(
+        serde_json::to_value(status::read(&mut db)?)?["state"],
+        "needs_attention"
+    );
+    assert_eq!(rows.as_slice(), std::slice::from_ref(&item));
     assert_eq!(generation(&mut db)?, 1);
     assert_eq!(fs::read(path)?, initial_file);
     let (raw, reference) = embeddings::table
@@ -639,7 +679,7 @@ fn rebuild_resumes_only_verified_checkpoints_after_interruption() -> Result<()> 
     for id in 1..=20 {
         store::upsert(&mut db, &repo(id, 2025, "fixture", "Rust"))?;
     }
-    assert!(build(&mut db, true, &|_| {}).is_err());
+    assert!(build_small_batches(&mut db, true, &|_| {}).is_err());
     assert_eq!(generation(&mut db)?, 0);
     let partial = serde_json::to_value(status::read(&mut db)?)?;
     assert_eq!(partial["projection_bytes"], 0);
@@ -666,6 +706,8 @@ fn rebuild_resumes_only_verified_checkpoints_after_interruption() -> Result<()> 
         .path()
         .join(format!("vector-payloads-{:x}", Sha256::digest(&owner)));
     fs::remove_dir_all(legacy_dir)?;
+    // These versions predate independently persisted metadata/body checkpoints.
+    diesel::delete(parts::embedding_parts::table).execute(&mut db)?;
     store::delete_meta(&mut db, "index_payload_storage")?;
     drop(db);
 
@@ -721,7 +763,7 @@ fn collection_is_searchable_with_filters_before_any_semantic_index() -> Result<(
     let mut account = store::connect(home.path())?;
     let mut other = store::connect_as(home.path(), "other")?;
     let rust = repo(1, 2025, "Rust source parser", "Rust");
-    let mut private_note = repo(2, 2025, "Source explorer", "Go");
+    let private_note = repo(2, 2025, "Source explorer", "Go");
     store::upsert(&mut account, &rust)?;
     store::upsert(&mut account, &private_note)?;
     store::upsert(&mut other, &repo(3, 2025, "Rust source toolkit", "Rust"))?;
@@ -733,7 +775,7 @@ fn collection_is_searchable_with_filters_before_any_semantic_index() -> Result<(
             ..Default::default()
         },
     )?;
-    private_note.note = "Rust fixture note".into();
+
     let q = crate::library::Query {
         query: "rust".into(),
         limit: Some(10),
@@ -741,8 +783,7 @@ fn collection_is_searchable_with_filters_before_any_semantic_index() -> Result<(
     };
     let (matches, keyword) = crate::library::interactive_search(&mut account, &q)?;
     assert!(keyword);
-    assert_eq!(matches.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2]);
-    assert_eq!(matches[1].note, private_note.note);
+    assert_eq!(matches.iter().map(|r| r.id).collect::<Vec<_>>(), [1]);
     let q = crate::library::Query {
         filter: Filter {
             language: Some("Go".into()),
@@ -758,5 +799,315 @@ fn collection_is_searchable_with_filters_before_any_semantic_index() -> Result<(
     assert_eq!(fresh["state"], "unbuilt");
     assert_eq!(fresh["repositories"], 2);
     assert_eq!(fresh["indexed"], 0);
+    Ok(())
+}
+
+#[test]
+fn v3_migration_indexes_live_rows_and_preserves_each_owners_annotations() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let path = home.path().join("starstack.sqlite3");
+    let mut old = Db::establish(path.to_str().unwrap())?;
+    old.batch_execute(include_str!("../schema.sql"))?;
+    old.batch_execute(include_str!("../lists_schema.sql"))?;
+    old.batch_execute(include_str!("../commits_schema.sql"))?;
+    old.batch_execute(
+        "ALTER TABLE repositories ADD COLUMN summary TEXT NOT NULL DEFAULT '';
+        ALTER TABLE repositories ADD COLUMN code_context TEXT NOT NULL DEFAULT '';
+        ALTER TABLE repositories ADD COLUMN commit_index TEXT NOT NULL DEFAULT '';
+        PRAGMA user_version=3",
+    )?;
+    for (owner, id, note, active) in [
+        ("primary", 8, "archival parser", true),
+        ("other", 8, "private compiler", true),
+        ("primary", 9, "archival removed", false),
+    ] {
+        use store::repositories as r;
+        diesel::insert_into(r::table)
+            .values((
+                r::owner_id.eq(owner),
+                r::id.eq(id),
+                r::active.eq(active),
+                r::metadata.eq(serde_json::to_string(&repo(id, 2025, "example", "Rust"))?),
+                r::note.eq(note),
+                r::pinned.eq(true),
+            ))
+            .execute(&mut old)?;
+    }
+    drop(old);
+    let mut db = store::connect(home.path())?;
+    #[derive(QueryableByName)]
+    struct Count {
+        #[diesel(sql_type = diesel::sql_types::BigInt)]
+        n: i64,
+    }
+    let indexed = |db: &mut Db, word: &str| -> Result<i64> {
+        Ok(diesel::sql_query("SELECT count(*) AS n FROM repository_fts WHERE repository_fts MATCH ? AND owner='primary'")
+            .bind::<diesel::sql_types::Text, _>(word).get_result::<Count>(db)?.n)
+    };
+    assert_eq!(indexed(&mut db, "archival")?, 1);
+    assert_eq!(indexed(&mut db, "compiler")?, 0);
+    let original = store::by_id(&mut db, 8)?;
+    assert!(original.pinned);
+    assert_eq!(original.note, "archival parser");
+    store::edit(
+        &mut db,
+        store::Edit {
+            id: 8,
+            note: Some("local handbook".into()),
+            ..Default::default()
+        },
+    )?;
+    assert_eq!(indexed(&mut db, "archival")?, 0);
+    assert_eq!(indexed(&mut db, "handbook")?, 1);
+    let mut other = store::connect_as(home.path(), "other")?;
+    assert_eq!(store::by_id(&mut other, 8)?.note, "private compiler");
+    Ok(())
+}
+
+#[test]
+fn structured_parts_reuse_only_unchanged_inputs_and_drop_removed_bodies() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut db = store::connect(home.path())?;
+    let requests = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+    let captured = requests.clone();
+    let server = Server::new(move |request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let inputs = body["input"].as_array().unwrap();
+        captured
+            .lock()
+            .unwrap()
+            .extend(inputs.iter().map(|v| v.as_str().unwrap().to_owned()));
+        Reply::json(json!({"embeddings": vec![[1.0, 0.0]; inputs.len()]}))
+    });
+    crate::ollama_settings::set_endpoints(&mut db, std::slice::from_ref(&server.url))?;
+    crate::ollama_settings::set(&mut db, Some(&server.url), Some("fixture"))?;
+    set_backend(&mut db, "ollama")?;
+    let mut item = repo(1, 2025, "parser", "Rust");
+    item.readme = "Original guide".into();
+    store::upsert(&mut db, &item)?;
+    let build_inputs = |db: &mut Db, rebuild| -> Result<Vec<String>> {
+        build(db, rebuild, &|_| {})?;
+        Ok(std::mem::take(&mut *requests.lock().unwrap()))
+    };
+    assert_eq!(build_inputs(&mut db, false)?.len(), 2);
+    store::edit(
+        &mut db,
+        store::Edit {
+            id: item.id,
+            note: Some("my bookmark".into()),
+            ..Default::default()
+        },
+    )?;
+    let q = crate::library::Query {
+        query: "bookmark".into(),
+        filter: Filter::default(),
+        limit: Some(2),
+    };
+    assert!(
+        crate::library::search_published(&mut db, &q)
+            .unwrap_err()
+            .is::<Stale>()
+    );
+    let changed = build_inputs(&mut db, false)?;
+    assert_eq!(changed.len(), 1);
+    assert!(changed[0].contains("my bookmark"));
+    item.readme = "Revised guide".into();
+    store::upsert(&mut db, &item)?;
+    assert_eq!(build_inputs(&mut db, false)?, ["Revised guide"]);
+    assert_eq!(build_inputs(&mut db, true)?.len(), 2);
+    item.readme.clear();
+    store::upsert(&mut db, &item)?;
+    assert!(build_inputs(&mut db, false)?.is_empty());
+    use parts::embedding_parts as t;
+    assert_eq!(t::table.select(t::part).load::<i32>(&mut db)?, [0]);
+    Ok(())
+}
+
+#[test]
+fn metadata_generation_is_searchable_while_prioritized_bodies_resume_after_edits() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut db = store::connect(home.path())?;
+    let body_batches = Arc::new(std::sync::Mutex::new(Vec::<Vec<String>>::new()));
+    let received = body_batches.clone();
+    let server = Server::new(move |request| {
+        let data: Value = serde_json::from_slice(&request.body).unwrap();
+        let inputs = data["input"].as_array().unwrap();
+        let bodies: Vec<_> = inputs
+            .iter()
+            .filter_map(Value::as_str)
+            .filter(|text| text.starts_with("guide-"))
+            .map(str::to_owned)
+            .collect();
+        if !bodies.is_empty() {
+            let mut batches = received.lock().unwrap();
+            batches.push(bodies);
+            if batches.len() == 2 {
+                return Reply::status(500);
+            }
+        }
+        let rows: Vec<_> = inputs
+            .iter()
+            .filter_map(Value::as_str)
+            .map(|input| {
+                if input.starts_with("Repository:") {
+                    [1.0, 0.0]
+                } else {
+                    [0.0, 1.0]
+                }
+            })
+            .collect();
+        Reply::json(json!({"embeddings": rows}))
+    });
+    crate::ollama_settings::set_endpoints(&mut db, std::slice::from_ref(&server.url))?;
+    crate::ollama_settings::set(&mut db, Some(&server.url), Some("fixture"))?;
+    set_backend(&mut db, "ollama")?;
+    let item = |id: i64| {
+        let mut repo = repo(id, 2000 + id as i32, "example", "Rust");
+        repo.readme = format!("guide-{id}");
+        repo
+    };
+    for id in 1..=18 {
+        store::upsert(&mut db, &item(id))?;
+    }
+    store::edit(
+        &mut db,
+        store::Edit {
+            id: 1,
+            pinned: Some(true),
+            ..Default::default()
+        },
+    )?;
+    assert!(build_small_batches(&mut db, false, &|_| {}).is_err());
+    assert_eq!(generation(&mut db)?, 1);
+    assert_eq!(
+        embedding_checkpoints::table
+            .count()
+            .get_result::<i64>(&mut db)?,
+        16
+    );
+    assert!(store::meta(&mut db, "index_pending")?.is_some());
+    assert_eq!(
+        serde_json::to_value(status::read(&mut db)?)?["body_pending"],
+        true
+    );
+    let q = crate::library::Query {
+        query: "probe".into(),
+        filter: Filter::default(),
+        limit: Some(50),
+    };
+    let first = crate::library::search_published(&mut db, &q)?;
+    assert_eq!(first.len(), 18);
+    assert!(first.iter().all(|row| row.score == Some(0.0)));
+    assert_eq!(
+        body_batches.lock().unwrap()[0][..3],
+        ["guide-1", "guide-18", "guide-17"]
+    );
+    drop(db);
+
+    let mut db = store::connect(home.path())?;
+    store::deactivate_missing(&mut db, &(2..=18).collect())?;
+    store::edit(
+        &mut db,
+        store::Edit {
+            id: 18,
+            note: Some("edited".into()),
+            ..Default::default()
+        },
+    )?;
+    store::edit(
+        &mut db,
+        store::Edit {
+            id: 3,
+            pinned: Some(true),
+            ..Default::default()
+        },
+    )?;
+    let mut changed = item(17);
+    changed.readme.push_str("-revised");
+    store::upsert(&mut db, &changed)?;
+    store::upsert(&mut db, &item(19))?;
+    build_small_batches(&mut db, false, &|_| {})?;
+    assert_eq!(generation(&mut db)?, 2);
+    assert_eq!(
+        serde_json::to_value(status::read(&mut db)?)?["body_pending"],
+        false
+    );
+    assert!(store::meta(&mut db, "index_pending")?.is_none());
+    let batches = body_batches.lock().unwrap();
+    let resumed: Vec<_> = batches[2..].iter().flatten().map(String::as_str).collect();
+    assert_eq!(
+        resumed,
+        ["guide-3", "guide-19", "guide-17-revised", "guide-2"]
+    );
+    drop(batches);
+    let complete = crate::library::search_published(&mut db, &q)?;
+    assert_eq!(complete.len(), 18);
+    assert!(
+        complete
+            .iter()
+            .all(|row| row.id != 1 && row.score.is_some_and(|score| score > 0.6))
+    );
+    assert_eq!(
+        complete.iter().find(|row| row.id == 18).unwrap().note,
+        "edited"
+    );
+    Ok(())
+}
+
+#[test]
+fn provider_progress_retains_submillisecond_work_and_reads_old_worker_events() -> Result<()> {
+    let mut counts: Progress = serde_json::from_value(json!({
+        "repositories":0, "total":2, "reused":0, "resumed":0, "chunks":0,
+        "tokens":0, "elapsed_seconds":0
+    }))?;
+    assert_eq!(counts.checkpoint_ms, 0);
+    for _ in 0..3 {
+        counts.add_embedding(EmbeddingWork {
+            tokens: Some(7),
+            tokenizer: Duration::from_micros(400),
+            inference: Duration::from_micros(700),
+        });
+    }
+    assert_eq!(
+        (counts.tokenizer_ms, counts.inference_ms, counts.tokens),
+        (1, 2, Some(21))
+    );
+    Ok(())
+}
+
+#[test]
+fn remote_embeddings_keep_order_across_requests_and_sum_token_usage() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut db = store::connect(dir.path())?;
+    let requests = Arc::new(AtomicUsize::new(0));
+    let count = requests.clone();
+    let server = Server::new(move |request| {
+        count.fetch_add(1, Ordering::Relaxed);
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let texts = body["input"].as_array().unwrap();
+        assert!(texts.len() <= 2);
+        let vectors: Vec<_> = texts
+            .iter()
+            .map(|s| vec![s.as_str().unwrap().parse::<f32>().unwrap()])
+            .collect();
+        Reply::json(json!({"embeddings": vectors,"prompt_eval_count":texts.len()*3}))
+    });
+    let mut engine = Engine::fixture(&server.url, DEFAULT_MODEL)?;
+    if let Runtime::Ollama(_, batches) = &mut engine.runtime {
+        *batches = RemoteBatches {
+            size: 2,
+            concurrent: 2,
+        };
+    }
+    let mut progress = Progress {
+        tokens: Some(0),
+        ..Progress::default()
+    };
+    let result = engine.embed(&mut db, &["1", "2", "3", "4"], &mut |work| {
+        progress.add_embedding(work)
+    })?;
+    assert_eq!(result, [[1.0], [2.0], [3.0], [4.0]]);
+    assert_eq!(requests.load(Ordering::Relaxed), 2);
+    assert_eq!(progress.tokens, Some(12));
     Ok(())
 }

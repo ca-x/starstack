@@ -100,6 +100,7 @@ const tabs = [
 
 export interface JobReport { message: string; warnings: string[]; details: string[] }
 export interface IndexProgress {
+  tokenizer_ms?: number; inference_ms?: number; checkpoint_ms?: number;
   repositories: number; total: number; reused: number; resumed?: number; chunks: number; tokens: number | null; elapsed_seconds: number;
 }
 export type Job = "sync" | "index" | "readmes";
@@ -156,6 +157,10 @@ export function Maintenance({ stats, admin, job, stages, error, initialTab, run 
           <div><dt>{t("复用仓库")}</dt><dd>{number.format(indexProgress.reused)}</dd></div>
           <div><dt>{t("已处理文本块")}</dt><dd>{number.format(indexProgress.chunks)}</dd></div>
           <div><dt>{t("已处理 token")}</dt><dd>{indexProgress.tokens === null ? t("服务未报告") : number.format(indexProgress.tokens)}</dd></div>
+          {([["tokenizer_ms", "分词耗时（毫秒）"], ["inference_ms", "推理耗时（毫秒）"], ["checkpoint_ms", "断点写入耗时（毫秒）"]] as const).map(([key, label]) => {
+            const value = indexProgress[key];
+            return value != null && <div key={key}><dt>{t(label)}</dt><dd>{number.format(value)}</dd></div>;
+          })}
           <div><dt>{t("计算用时（秒）")}</dt><dd>{number.format(indexProgress.elapsed_seconds)}</dd></div>
         </dl>
       </div>}

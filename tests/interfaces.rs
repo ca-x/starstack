@@ -148,15 +148,17 @@ fn http_accounts_confirmation_and_revocation() -> Result<()> {
     post(
         "settings",
         &reader,
-        json!({"quota_reserve_percent":17,"readme_budget":4,"readme_interval_minutes":0}),
+        json!({"quota_reserve_percent":17,"readme_budget":4,"readme_interval_minutes":0,"initial_readme_boost":true}),
     )?
     .error_for_status()?;
     let policy = settings(&reader)?;
     assert_eq!(policy["sync_interval_minutes"], 13);
     assert_eq!(policy["quota_reserve_percent"], 17);
     assert_eq!(policy["readme_budget"], 4);
+    assert_eq!(policy["initial_readme_boost"], true);
     assert_eq!(policy["readme_interval_minutes"], 0);
     assert_eq!(settings(&admin)?["quota_reserve_percent"], 5);
+    assert_eq!(settings(&admin)?["initial_readme_boost"], false);
     let accepted: Value = post("readmes", &reader, json!({}))?
         .error_for_status()?
         .json()?;

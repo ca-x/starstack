@@ -25,7 +25,7 @@ const HEADS: usize = 16;
 const KV_HEADS: usize = 8;
 const HEAD_DIM: usize = 128;
 const WINDOW: usize = 512;
-pub(crate) const PROTOCOL: &str = "qwen3-causal-eot-last-512-stride64-v1";
+pub(crate) const PROTOCOL: &str = "qwen3-causal-eot-last-512-stride64-v2";
 
 struct Block {
     attention_norm: RmsNorm,
@@ -156,17 +156,19 @@ impl Encoder {
     pub(super) fn embed(
         &self,
         texts: &[&str],
-        observed: &mut dyn FnMut(usize),
+        observed: &mut dyn FnMut(crate::index::EmbeddingWork),
     ) -> Result<Vec<Vec<f32>>> {
         texts
             .iter()
             .map(|text| {
                 // The official embedding tokenizer appends <|endoftext|> (151643) to
                 // every window. The generative EOS in some GGUF exports is different.
+                let started = std::time::Instant::now();
                 let mut first = self
                     .tokenizer
                     .encode(*text, true)
                     .map_err(|e| anyhow!("{e}"))?;
+                observed(crate::index::EmbeddingWork::tokenized(started.elapsed()));
                 let rest = first.take_overflowing();
                 let mut mean = Mean::default();
                 for window in std::iter::once(first).chain(rest) {
@@ -175,6 +177,7 @@ impl Encoder {
                         ids.len() <= WINDOW && ids.last() == Some(&151643),
                         "Qwen3 分词器未添加正确的结束标记"
                     );
+                    let started = std::time::Instant::now();
                     let input = Tensor::new(ids, &Device::Cpu)?.unsqueeze(0)?;
                     let mut h = self.table.embedding(&input)?;
                     for block in &self.blocks {
@@ -185,8 +188,12 @@ impl Encoder {
                         .apply(&self.norm)?
                         .reshape(WIDTH)?
                         .to_vec1::<f32>()?;
-                    mean.push(&last)?;
-                    observed(ids.len());
+                    mean.push_weighted(&last, ids.len() as f64)?;
+                    observed(crate::index::EmbeddingWork {
+                        tokens: Some(ids.len()),
+                        tokenizer: std::time::Duration::ZERO,
+                        inference: started.elapsed(),
+                    });
                 }
                 mean.finish()
             })

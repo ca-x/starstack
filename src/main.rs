@@ -3,6 +3,7 @@ mod ai;
 mod auth;
 mod chat_settings;
 mod chunking;
+mod eval;
 mod firecrawl;
 mod index;
 mod index_worker;
@@ -88,6 +89,11 @@ enum Command {
     Models {
         #[command(subcommand)]
         action: Option<ModelAction>,
+    },
+    /// 用 JSON Lines 标注问题衡量检索召回率
+    Eval {
+        #[arg(long)]
+        queries: PathBuf,
     },
     /// 一句话召回收藏
     Search {
@@ -319,6 +325,7 @@ fn run() -> Result<()> {
                 }
             }
         },
+        Command::Eval { queries } => eval::run(&mut db, &queries)?,
         Command::Search {
             query,
             filter,

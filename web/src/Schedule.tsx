@@ -19,6 +19,7 @@ interface PendingRetry { next_at: number; attempts: number }
 interface Settings extends Partial<Record<RetryKey, boolean>> {
   retry_pending?: { sync?: PendingRetry | null; readme?: PendingRetry | null };
   readme_source?: ReadmeSource;
+  initial_readme_boost?: boolean;
   firecrawl_available?: boolean;
   sync_interval_minutes: number;
   quota_reserve_percent?: number;
@@ -73,6 +74,7 @@ export function Schedule({ jobActive, confirm, fetchReadmes }: { jobActive: bool
   const [draft, setDraft] = useState<Partial<Record<SettingKey, string>>>({});
   const [retryDraft, setRetryDraft] = useState<Partial<Record<RetryKey, boolean>>>({});
   const [draftSource, setDraftSource] = useState<ReadmeSource>();
+  const [draftBoost, setDraftBoost] = useState<boolean>();
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
   const [error, setError] = useState("");
@@ -104,11 +106,12 @@ export function Schedule({ jobActive, confirm, fetchReadmes }: { jobActive: bool
     readme_interval_minutes: settings?.readme_interval_minutes ?? 30,
   };
   const source = settings?.readme_source ?? "github";
-  const patch: Partial<Record<SettingKey, number>> & Partial<Record<RetryKey, boolean>> & { readme_source?: ReadmeSource } = {};
+  const patch: Partial<Record<SettingKey, number>> & Partial<Record<RetryKey, boolean>> & Pick<Settings, "readme_source" | "initial_readme_boost"> = {};
   for (const [key] of retryTasks) {
     if (retryDraft[key] !== undefined && retryDraft[key] !== (settings?.[key] ?? true)) patch[key] = retryDraft[key];
   }
   if (draftSource && draftSource !== source) patch.readme_source = draftSource;
+  if (draftBoost !== undefined && draftBoost !== (settings?.initial_readme_boost ?? false)) patch.initial_readme_boost = draftBoost;
   let valid = patch.readme_source !== "firecrawl" || settings?.firecrawl_available === true;
   for (const { key, max } of fields) {
     if (draft[key] === undefined) continue;
@@ -129,6 +132,7 @@ export function Schedule({ jobActive, confirm, fetchReadmes }: { jobActive: bool
       setDraft({});
       setRetryDraft({});
       setDraftSource(undefined);
+      setDraftBoost(undefined);
       setSaved(true);
       setRevision(n => n + 1);
     } catch (e) { setError(message(e)); } finally { setBusy(false); }
@@ -154,6 +158,10 @@ export function Schedule({ jobActive, confirm, fetchReadmes }: { jobActive: bool
               }} />
           </EuiFormRow>
         )}
+          <EuiFormRow fullWidth helpText={t("首次补全期间，按 GitHub 返回的可用额度将每轮预算提高至最多 1000 次。预算为 0 时暂停。")}>
+            <EuiSwitch label={t("加速首次 README 补全")} checked={draftBoost ?? settings?.initial_readme_boost ?? false}
+              disabled={!settings || busy} onChange={e => { setDraftBoost(e.target.checked); setSaved(false); }} />
+          </EuiFormRow>
           <EuiFormRow fullWidth label={t("公开仓库 README 来源")} helpText={settings?.firecrawl_available
             ? t("Firecrawl Local 在本机抓取公开仓库 URL。私人仓库使用你的 GitHub 授权，收藏分类及成员始终来自 GitHub。")
             : t("需使用启用 Firecrawl Local 的构建。私人仓库、收藏分类及成员均通过 GitHub 获取。")}>

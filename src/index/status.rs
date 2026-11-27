@@ -21,6 +21,7 @@ pub(crate) struct Status {
     repositories: i64,
     indexed: i64,
     checkpoints: i64,
+    body_pending: bool,
     projection_bytes: u64,
     vector_payload_bytes: u64,
     legacy_payload_bytes: i64,
@@ -101,7 +102,9 @@ pub(crate) fn read(db: &mut Db) -> Result<Status> {
             Usage::default()
         };
         let published = active_file.is_some() && has_embeddings;
-        let index_issue = store::meta(db, "index_issue")?.is_some()
+        let incompatible = published && super::needs_rebuild(db).unwrap_or(true);
+        let body_pending = published && !incompatible && store::meta(db, "index_body_pending")?.is_some();
+        let index_issue = incompatible || store::meta(db, "index_issue")?.is_some()
             || generation.as_ref().is_err()
             || generation.is_ok_and(|id| id > 0 && !published);
         let state = if index_issue {
@@ -126,6 +129,7 @@ pub(crate) fn read(db: &mut Db) -> Result<Status> {
             repositories: total,
             indexed: if published { vectors.active } else { 0 },
             checkpoints: checkpoint.active,
+            body_pending,
             projection_bytes,
             vector_payload_bytes: Payloads::new(&dir, &owner).disk_bytes()?,
             legacy_payload_bytes: vectors.bytes + checkpoint.bytes,

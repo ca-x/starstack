@@ -66,7 +66,26 @@ starstack index --rebuild
 
 内置目录还提供原生 Qwen3-Embedding-0.6B Q4_K_M，下载约 387 MiB。运行 `starstack models download qwen3-embedding-0.6b-q4-k-m --source modelscope`，再运行 `starstack models select builtin --model qwen3-embedding-0.6b-q4-k-m` 即可选用。管理员也可搜索模型库或上传离线文件。两款预设会核对固定 SHA-256，自定义模型支持单文件 safetensors 权重、384 维均值池化的 Sentence Transformers BERT 模型。
 
-在「分块预设」中，每个账号可为当前后端选择均衡、短分块、长分块或整篇。新库默认均衡，每块 512 个字符，相邻块重叠 64 个字符。原有 Ollama 索引沿用整篇。更改检索模型或分块设置后，在该账号下选择「重建索引」。部署者可为任一下载源配置镜像。[模型下载、镜像与索引设置](docs/deploy.md#检索模型与分块)
+内置模型用自带的分词器将长文本自动拆成重叠窗口。使用 Ollama 时，可在「语义索引 → 分块预设」调整当前账号发给远端模型的单个文本块长度。尚未保存 Ollama 预设的账号默认使用均衡。选择整篇时，元数据段和正文段各自作为一个输入。
+
+使用 Ollama 建索引时，`STARSTACK_OLLAMA_BATCH_SIZE` 决定每次请求的输入条数（默认 64，范围 1–128），`STARSTACK_OLLAMA_CONCURRENCY` 决定最大并发请求数（默认 2，范围 1–4）。界面的推理耗时包含网络往返。内置模型在本机进程内计算。
+
+星栈将仓库元数据和私人批注编码为一段，将清理后的 README、已保存的代码片段和提交说明编码为另一段，然后合成每仓一个向量。后续更新可复用内容未变的段。实例环境变量 `STARSTACK_README_INDEX_CHARS` 控制进入向量索引的 README 长度，默认 4000 个 Unicode 字符，可设为 0 至 65536。设为 0 可跳过 README 正文，README 抓取和存储仍按各自设置运行。
+
+首次建立结构化索引且有正文待处理时，星栈先发布可检索的仓库元数据，再优先补全置顶和最近收藏仓库的正文。可以在「语义索引」查看正文是否仍待补全。
+
+从旧版文本索引升级，或更换模型、分块、README 上限后，在受影响的账号中点击「重建索引」。本机初始库可运行 `starstack index --rebuild`。检索会合并语义和关键词排名，准确的项目名也能通过关键词命中。[模型下载、镜像与索引设置](docs/deploy.md#检索模型与分块)
+
+### 用自己的收藏评测检索
+
+创建 `queries.jsonl`，每行写一个日常检索问题和一个或多个预期命中的仓库。将示例仓库换成自己已经收藏的项目。
+
+```jsonl
+{"query":"递归搜索目录中的文本","expect":["BurntSushi/ripgrep"]}
+{"query":"命令行交互式模糊查找工具","expect":["junegunn/fzf"]}
+```
+
+索引发布后运行 `starstack eval --queries queries.jsonl`。输出包含平均 Recall@5、MRR@100，以及毫秒计的 p50/p95 查询耗时。比较配置时，使用同一收藏库和问题集，在每次重建完成后评测。
 
 ## GitHub 收藏分类
 
@@ -136,6 +155,8 @@ MCP 默认使用当前账号的 Embedding 索引。在「MCP 接入 → 检索�
 | GitHub 限流或 token 失效 | 星栈按账户分别记录 REST 和 GraphQL 响应中的额度窗口。默认预留 5% 配额，每轮 README 最多 200 次请求。若触及预留值，目录仍可使用剩余额度；耗尽或收到限流后遵守重置时间。目录分页不完整时保留原有成员和游标。 |
 | 检索模型未就绪 | 同步的元数据已保存。内置模型可重新下载或切换下载源，使用 Ollama 的账号则需确认服务在线、模型已安装，再运行索引。 |
 | 搬家、备份 | 停止服务及其他写入进程，备份整个 `STARSTACK_HOME`。其中包括设备授权凭证，请保护备份。 |
+
+在「同步与索引 → 计划与额度」中可开启「加速首次 README 补全」。首次导入期间，星栈根据 GitHub 返回的剩余额度，将正数预算临时提高至每轮最多 1000 次请求，已设置更高预算的账号沿用原值。待处理队列首次清空后恢复常规预算。使用 GitHub 来源时，一次 GraphQL 请求可读取最多三个公开仓库的根目录 README，缺失或不适用的结果通过 REST 补抓。Firecrawl 抓取失败时也在额度允许后转用认证 REST。
 
 README 抓取失败时，已入库的目录、上一版 README 和私人批注仍可用，待处理队列下轮继续。CLI 的 `sync` 会在前台完成一批；Web 服务可异步补全。在「同步与索引」中可按用户调整预算与预留比例。发行版内置 Firecrawl Local。每个账号可选 GitHub API 或 Firecrawl Local 抓取 README。Firecrawl Local 在本机解析公开仓库页面，私有仓库和可见性未知的仓库使用 GitHub REST。Firecrawl Local 使用 AGPL-3.0 许可。[部署与抓取方式](docs/deploy.md) · [Firecrawl Local](https://crates.io/crates/firecrawl-local/0.1.1)
 

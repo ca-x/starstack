@@ -421,3 +421,199 @@ fn readme_budget_rotates_past_a_failing_repository_and_honors_private_visibility
     );
     Ok(())
 }
+
+const CORE_SURPLUS: &str = "X-RateLimit-Resource: core\r\nX-RateLimit-Limit: 100\r\nX-RateLimit-Remaining: 20\r\nX-RateLimit-Reset: 4102444800\r\n";
+
+#[test]
+fn initial_backfill_uses_public_blobs_and_resumes_the_regular_budget() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut db = store::connect(temp.path())?;
+    // Libraries with older persisted policies keep the default behavior.
+    store::set_meta(
+        &mut db,
+        "quota_policy",
+        r#"{"reserve_percent":5,"readme_budget":1,"readme_source":"github"}"#,
+    )?;
+    let mut policy = QuotaPolicy::load(&mut db)?;
+    assert!(!policy.initial_readme_boost);
+    policy.initial_readme_boost = true;
+    policy.save(&mut db)?;
+    let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let server = {
+        let calls = calls.clone();
+        Server::new(move |r| {
+            assert!(r.headers.contains("authorization: bearer test-only"));
+            calls.lock().unwrap().push(r.target.clone());
+            match r.target.as_str() {
+                "/user" => Reply {
+                    headers: CORE_SURPLUS,
+                    ..Reply::json(json!({"id":1}))
+                },
+                path if path.ends_with("page=1") => {
+                    let mut private = star(1, 1);
+                    private["repo"]["private"] = json!(true);
+                    Reply::json(json!([private, star(2, 2), star(3, 3)]))
+                }
+                "/graphql" => {
+                    let body: serde_json::Value = serde_json::from_slice(&r.body).unwrap();
+                    assert_eq!(
+                        body["variables"],
+                        json!({"o0":"sample","n0":"r2","o1":"sample","n1":"r3"})
+                    );
+                    assert!(body["query"].as_str().unwrap().contains("HEAD:.github"));
+                    Reply {
+                        headers: "X-RateLimit-Resource: graphql\r\nX-RateLimit-Limit: 100\r\nX-RateLimit-Remaining: 49\r\nX-RateLimit-Reset: 4102444800\r\n",
+                        ..Reply::json(json!({"data":{
+                            "r0":{"dot":null,"object":{"byteSize":5,"isBinary":false,"isTruncated":false,"text":"hello"}},
+                            "r1":{"dot":{"entries":[{"name":"README.rst"}]},"object":{"byteSize":4,"isBinary":false,"isTruncated":false,"text":"root"}}
+                        }}))
+                    }
+                }
+                target if target.ends_with("/readme") => Reply {
+                    body: "via REST".into(),
+                    ..Reply::status(200)
+                },
+                _ => panic!("unexpected {}", r.target),
+            }
+        })
+    };
+    let gh = GitHub {
+        client: Client::builder().no_proxy().build()?,
+        token: "test-only",
+        base: &server.url,
+    };
+    synchronize(&mut db, true, Mode::Catalog, &gh, &|_| {})?;
+    assert!(store::meta(&mut db, INITIAL_READMES)?.is_some());
+    let result = synchronize(&mut db, false, Mode::PendingOnly, &gh, &|_| {})?;
+    assert_eq!((result.readmes_fetched, result.pending_readmes), (3, 0));
+    assert_eq!(store::by_id(&mut db, 2)?.readme, "hello");
+    assert_eq!(store::by_id(&mut db, 1)?.readme, "via REST");
+    assert_eq!(store::by_id(&mut db, 3)?.readme, "via REST");
+    assert_eq!(
+        Window::load(&mut db, Resource::Graphql)?.remaining,
+        Some(49)
+    );
+    assert!(store::meta(&mut db, INITIAL_READMES)?.is_none());
+    calls.lock().unwrap().clear();
+    store::set_meta(&mut db, PENDING, "[1,2,3]")?;
+    let result = synchronize(&mut db, false, Mode::PendingOnly, &gh, &|_| {})?;
+    assert_eq!((result.readmes_fetched, result.pending_readmes), (1, 2));
+    let calls = calls.lock().unwrap();
+    assert_eq!(calls.len(), 2);
+    assert!(!calls.iter().any(|v| v == "/graphql"));
+    Ok(())
+}
+
+#[test]
+fn secondary_graphql_limit_prevents_rest_fallback_and_keeps_the_queue() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut db = store::connect(dir.path())?;
+    QuotaPolicy {
+        initial_readme_boost: true,
+        ..Default::default()
+    }
+    .save(&mut db)?;
+    let server = Server::new(|r| match r.target.as_str() {
+        "/user" => Reply {
+            headers: CORE_SURPLUS,
+            ..Reply::json(json!({"id":1}))
+        },
+        path if path.ends_with("page=1") => Reply::json(json!([star(2, 2), star(1, 1)])),
+        "/graphql" => Reply {
+            status: 403,
+            headers: "Retry-After: 120\r\n",
+            body: r#"{"message":"secondary rate limit"}"#.to_owned(),
+        },
+        path => panic!("unexpected fallback {path}"),
+    });
+    let gh = GitHub {
+        client: Client::builder().no_proxy().build()?,
+        token: "fixture",
+        base: &server.url,
+    };
+    let result = synchronize(&mut db, true, Mode::Readmes, &gh, &|_| {})?;
+    assert_eq!((result.readmes_fetched, result.pending_readmes), (0, 2));
+    for resource in [Resource::Graphql, Resource::Rest] {
+        assert!(Window::load(&mut db, resource)?.check().is_err());
+    }
+    assert!(store::meta(&mut db, INITIAL_READMES)?.is_some());
+    Ok(())
+}
+
+#[test]
+fn failed_public_scrape_falls_back_to_rest_on_next_budget() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut db = store::connect(dir.path())?;
+    store::set_meta(
+        &mut db,
+        "quota_policy",
+        r#"{"reserve_percent":5,"readme_budget":1,"readme_source":"firecrawl"}"#,
+    )?;
+    // The authenticated fixture is direct. The public scraper uses this rejecting loopback proxy.
+    let proxy = Server::new(|r| {
+        assert!(!r.headers.contains("authorization:"));
+        Reply::status(403)
+    });
+    store::set_meta(&mut db, "github_proxy", &proxy.url)?;
+    let server = Server::new(|r| match r.target.as_str() {
+        "/user" => Reply::json(json!({"id":1})),
+        path if path.ends_with("page=1") => Reply::json(json!([star(1, 1)])),
+        "/repos/sample/r1/readme" => Reply {
+            body: "canonical".into(),
+            ..Reply::status(200)
+        },
+        path => panic!("unexpected {path}"),
+    });
+    let gh = GitHub {
+        client: Client::builder().no_proxy().build()?,
+        token: "fixture",
+        base: &server.url,
+    };
+    let first = synchronize(&mut db, true, Mode::Readmes, &gh, &|_| {})?;
+    assert_eq!((first.readmes_fetched, first.pending_readmes), (0, 1));
+    assert!(store::meta(&mut db, REST_FALLBACK)?.is_some());
+    let second = synchronize(&mut db, false, Mode::PendingOnly, &gh, &|_| {})?;
+    assert_eq!((second.readmes_fetched, second.pending_readmes), (1, 0));
+    assert_eq!(store::by_id(&mut db, 1)?.readme, "canonical");
+    assert!(store::meta(&mut db, REST_FALLBACK)?.is_none());
+    Ok(())
+}
+
+#[test]
+fn boost_respects_zero_budget_and_separate_graphql_reserve() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut db = store::connect(dir.path())?;
+    let mut policy = QuotaPolicy {
+        initial_readme_boost: true,
+        readme_budget: 0,
+        ..Default::default()
+    };
+    policy.save(&mut db)?;
+    let server = Server::new(|r| match r.target.as_str() {
+        "/user" => Reply {
+            headers: CORE_SURPLUS,
+            ..Reply::json(json!({"id":1}))
+        },
+        path if path.ends_with("page=1") => Reply::json(json!([star(2, 2), star(1, 1)])),
+        path if path.ends_with("/readme") => Reply::status(404),
+        path => panic!("unexpected {path}"),
+    });
+    let gh = GitHub {
+        client: Client::builder().no_proxy().build()?,
+        token: "fixture",
+        base: &server.url,
+    };
+    let paused = synchronize(&mut db, true, Mode::Readmes, &gh, &|_| {})?;
+    assert_eq!((paused.readmes_fetched, paused.pending_readmes), (0, 2));
+    let mut graph = Window::load(&mut db, Resource::Graphql)?;
+    graph.limit = Some(100);
+    graph.remaining = Some(5);
+    graph.reset_at = Some(Utc::now().timestamp() + 3600);
+    graph.save(&mut db, Resource::Graphql)?;
+    policy.readme_budget = 1;
+    policy.save(&mut db)?;
+    let complete = synchronize(&mut db, false, Mode::PendingOnly, &gh, &|_| {})?;
+    assert_eq!((complete.readmes_fetched, complete.pending_readmes), (2, 0));
+    assert_eq!(Window::load(&mut db, Resource::Graphql)?.remaining, Some(5));
+    Ok(())
+}

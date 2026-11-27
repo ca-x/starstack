@@ -1,7 +1,12 @@
 //! Built-in Candle and Ollama embeddings with an immutable, filtered HawDB cosine projection.
+mod exact;
 pub(crate) mod mean;
+mod parts;
 mod payloads;
 pub(crate) mod status;
+mod text;
+mod tier;
+use tier::Tier;
 
 use std::cell::OnceCell;
 use std::collections::BTreeMap;
@@ -14,8 +19,8 @@ use chrono::{Datelike, NaiveDate, Utc};
 use diesel::connection::SimpleConnection;
 use diesel::prelude::*;
 use hawdb_vector_projection::{
-    FileProjection, ProjectionBuildConfig, ProjectionIdentity, ProjectionMetric,
-    ProjectionSearchOptions, ProjectionWriter, RaBitQBitWidth,
+    FileProjection, ProjectionBuildConfig, ProjectionIdentity, ProjectionMetric, ProjectionWriter,
+    RaBitQBitWidth,
 };
 use reqwest::blocking::Client;
 use serde::Deserialize;
@@ -50,6 +55,9 @@ diesel::table! {
 
 const SCHEMA: &str = "CREATE TABLE IF NOT EXISTS embeddings (
     owner TEXT NOT NULL, id INTEGER NOT NULL, fingerprint BLOB NOT NULL, vector BLOB NOT NULL, checksum BLOB NOT NULL, PRIMARY KEY(owner,id)
+);
+CREATE TABLE IF NOT EXISTS embedding_parts (
+    owner TEXT NOT NULL, id INTEGER NOT NULL, part INTEGER NOT NULL, fingerprint BLOB NOT NULL, checksum BLOB NOT NULL, PRIMARY KEY(owner,id,part)
 );
 CREATE TABLE IF NOT EXISTS embedding_checkpoints (
     owner TEXT NOT NULL, id INTEGER NOT NULL, fingerprint BLOB NOT NULL, vector BLOB NOT NULL, checksum BLOB NOT NULL, PRIMARY KEY(owner,id)
@@ -196,8 +204,8 @@ impl Selection {
         Ok(Self { provider, policy })
     }
 
-    fn identity(&self) -> String {
-        let base = match &self.provider {
+    fn model_identity(&self) -> String {
+        match &self.provider {
             // Preserve the first MiniLM index format only for the exact original
             // config, tokenizer and weights. A repinned package must get a new key.
             Provider::Builtin {
@@ -216,7 +224,7 @@ impl Selection {
                 let protocol = if *family == "qwen3-gguf" {
                     crate::native_embedding::QWEN_PROTOCOL
                 } else {
-                    "masked-mean-128-stride24-v2"
+                    "masked-mean-128-stride24-v3"
                 };
                 format!("builtin:{id}:{fingerprint}:{protocol}")
             }
@@ -225,7 +233,11 @@ impl Selection {
             Provider::Ollama { url, model } => {
                 format!("ollama:{model}@{:x}", Sha256::digest(url.as_bytes()))
             }
-        };
+        }
+    }
+
+    fn identity(&self) -> String {
+        let base = self.model_identity();
         if self.policy.legacy() {
             base
         } else {
@@ -250,8 +262,74 @@ pub(crate) fn needs_rebuild(db: &mut Db) -> Result<bool> {
     db.transaction(|db| Selection::read(db)?.mismatches(db))
 }
 
+/// Work measured inside a provider. Remote inference includes the HTTP round trip.
+pub(crate) struct EmbeddingWork {
+    pub tokens: Option<usize>,
+    pub tokenizer: Duration,
+    pub inference: Duration,
+}
+
+impl EmbeddingWork {
+    pub fn tokenized(time: Duration) -> Self {
+        Self {
+            tokens: Some(0),
+            tokenizer: time,
+            inference: Duration::ZERO,
+        }
+    }
+}
+
+// Keep sub-millisecond work across batches and round only the reported total.
+fn accumulate_ms(milliseconds: &mut u64, fraction: &mut Duration, delta: Duration) {
+    let total = *fraction + delta;
+    let whole = total.as_millis() as u64;
+    *milliseconds = milliseconds.saturating_add(whole);
+    *fraction = total - Duration::from_millis(whole);
+}
+
+impl Progress {
+    fn add_embedding(&mut self, work: EmbeddingWork) {
+        self.tokens = self
+            .tokens
+            .zip(work.tokens)
+            .map(|(a, b)| a.saturating_add(b));
+        accumulate_ms(
+            &mut self.tokenizer_ms,
+            &mut self.tokenizer_fraction,
+            work.tokenizer,
+        );
+        accumulate_ms(
+            &mut self.inference_ms,
+            &mut self.inference_fraction,
+            work.inference,
+        );
+    }
+}
+
+#[derive(Clone, Copy)]
+struct RemoteBatches {
+    size: usize,
+    concurrent: usize,
+}
+
+impl RemoteBatches {
+    fn configured() -> Result<Self> {
+        fn read(key: &str, default: usize, max: usize) -> Result<usize> {
+            let value = std::env::var(key)
+                .map_or(Ok(default), |v| v.parse())
+                .with_context(|| format!("{key} 应为 1 至 {max} 的整数"))?;
+            ensure!((1..=max).contains(&value), "{key} 应为 1 至 {max} 的整数");
+            Ok(value)
+        }
+        Ok(Self {
+            size: read("STARSTACK_OLLAMA_BATCH_SIZE", 64, 128)?,
+            concurrent: read("STARSTACK_OLLAMA_CONCURRENCY", 2, 4)?,
+        })
+    }
+}
+
 enum Runtime {
-    Ollama(Client),
+    Ollama(Client, RemoteBatches),
     Builtin {
         home: PathBuf,
         files: OnceCell<crate::models::ModelFiles>,
@@ -287,6 +365,7 @@ impl Engine {
                     .connect_timeout(Duration::from_secs(5))
                     .timeout(timeout)
                     .build()?,
+                RemoteBatches::configured()?,
             ),
         };
         Ok(Self {
@@ -295,6 +374,13 @@ impl Engine {
             managed: true,
             profile: None,
         })
+    }
+
+    fn group_size(&self) -> usize {
+        match &self.runtime {
+            Runtime::Ollama(_, batches) => batches.size * batches.concurrent,
+            Runtime::Builtin { .. } => 64,
+        }
     }
 
     // Keep the shared filesystem lease through publication or the last result check.
@@ -335,7 +421,13 @@ impl Engine {
                 },
                 policy: crate::chunking::Policy::whole_document(),
             },
-            runtime: Runtime::Ollama(Client::builder().no_proxy().build()?),
+            runtime: Runtime::Ollama(
+                Client::builder().no_proxy().build()?,
+                RemoteBatches {
+                    size: BATCH,
+                    concurrent: 1,
+                },
+            ),
             managed: false,
             profile: None,
         })
@@ -345,7 +437,7 @@ impl Engine {
         &self,
         db: &mut Db,
         texts: &[&str],
-        observed: &mut dyn FnMut(Option<usize>),
+        observed: &mut dyn FnMut(EmbeddingWork),
     ) -> Result<Vec<Vec<f32>>> {
         // Re-check before sending each batch. A settings change during one request
         // must stop later batches from sending repository text to the former server.
@@ -357,12 +449,41 @@ impl Engine {
                     files.get().context("内置模型不可用")?.path(),
                     family,
                     texts,
-                    &mut |tokens| observed(Some(tokens)),
+                    observed,
                 )
             }
-            (Runtime::Ollama(client), Provider::Ollama { url, model }) => {
-                let (vectors, tokens) = ollama_embed(client, url, model, texts)?;
-                observed(tokens);
+            (Runtime::Ollama(client, batches), Provider::Ollama { url, model }) => {
+                let started = std::time::Instant::now();
+                let (vectors, tokens) = if texts.len() <= batches.size {
+                    ollama_embed(client, url, model, texts)?
+                } else {
+                    // Dispatch one bounded wave. The handles retain input order even if
+                    // a later request finishes first. Another wave revalidates the owner settings.
+                    ensure!(texts.len() <= self.group_size(), "Ollama 批次超出并发上限");
+                    std::thread::scope(|scope| -> Result<_> {
+                        let handles: Vec<_> = texts
+                            .chunks(batches.size)
+                            .map(|chunk| {
+                                scope.spawn(move || ollama_embed(client, url, model, chunk))
+                            })
+                            .collect();
+                        let mut rows = Vec::with_capacity(texts.len());
+                        let mut tokens = Some(0usize);
+                        for handle in handles {
+                            let (vectors, count) = handle
+                                .join()
+                                .map_err(|_| anyhow::anyhow!("Ollama 请求线程中断"))??;
+                            rows.extend(vectors);
+                            tokens = tokens.zip(count).map(|(a, b)| a.saturating_add(b));
+                        }
+                        Ok((rows, tokens))
+                    })?
+                };
+                observed(EmbeddingWork {
+                    tokens,
+                    tokenizer: Duration::ZERO,
+                    inference: started.elapsed(),
+                });
                 Ok(vectors)
             }
             _ => anyhow::bail!("嵌入配置不一致"),
@@ -418,31 +539,35 @@ fn valid(vector: &[f32]) -> bool {
 }
 
 fn document(repo: &Repo) -> String {
-    let mut text = format!(
-        "Repository: {}\nDescription: {}\nLanguage: {}\nTopics: {}\nLicense: {}\nTags: {}\nNote: {}",
-        repo.full_name,
-        repo.description.as_deref().unwrap_or(""),
-        repo.language.as_deref().unwrap_or(""),
-        repo.topics.join(", "),
-        repo.license.as_deref().unwrap_or(""),
-        repo.tags.join(", "),
-        repo.note
-    );
-    for (label, content) in [
-        ("Saved summary", &repo.summary),
-        ("Saved code", &repo.code_context),
-    ] {
-        if !content.is_empty() {
-            text.push_str(&format!("\n{label}: {content}"));
-        }
+    let mut result = text::metadata(repo);
+    if !repo.code_context.is_empty() {
+        result.push_str(&format!("\nSaved code: {}", repo.code_context));
     }
     if !repo.commit_index.is_empty() {
-        text.push_str("\nRecent commits: ");
-        text.push_str(&repo.commit_index);
+        result.push_str(&format!("\nRecent commits: {}", repo.commit_index));
     }
-    text.push_str("\nREADME: ");
-    text.push_str(&repo.readme);
-    text
+    result.push_str("\nREADME: ");
+    result.push_str(&repo.readme);
+    result
+}
+
+fn structured_hash(key: &str, meta: &str, body: &str) -> Vec<u8> {
+    Sha256::new()
+        .chain_update(key.as_bytes())
+        .chain_update([0])
+        .chain_update((meta.len() as u64).to_le_bytes())
+        .chain_update(meta.as_bytes())
+        .chain_update(body.as_bytes())
+        .finalize()
+        .to_vec()
+}
+
+fn document_hash(selection: &Selection, key: &str, repo: &Repo, tier: Tier) -> Vec<u8> {
+    if let crate::chunking::Policy::Structured { body_cap, .. } = selection.policy {
+        structured_hash(key, &text::metadata(repo), &tier.body(repo, body_cap))
+    } else {
+        fingerprint(key, &document(repo))
+    }
 }
 
 fn fingerprint(model: &str, text: &str) -> Vec<u8> {
@@ -505,14 +630,57 @@ struct Document {
     hash: Vec<u8>,
 }
 
-fn documents(conn: &mut Db, model: &str) -> Result<Vec<Document>> {
+fn documents(
+    conn: &mut Db,
+    owner: &str,
+    selection: &Selection,
+    model: &str,
+    rebuild: bool,
+    tier: Tier,
+) -> Result<Vec<Document>> {
+    use diesel::sql_types::{BigInt, Binary, Nullable, Text};
+    #[derive(QueryableByName)]
+    struct Source {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+        #[diesel(sql_type = Nullable<Binary>)]
+        fingerprint: Option<Vec<u8>>,
+    }
+    if !rebuild
+        && matches!(tier, Tier::Full)
+        && store::meta(conn, "index_body_pending")?.is_none()
+        && store::meta(conn, "index_identity")?.as_deref() == Some(model)
+        && store::meta(conn, "index_source_versions")?.is_some()
+    {
+        // A published version covers all embedding inputs. Decode repository JSON
+        // and parse Markdown only for new or changed sources in this snapshot.
+        let sources = diesel::sql_query(
+            "SELECT r.id, e.fingerprint FROM repositories r
+             LEFT JOIN index_source_versions v ON v.owner=r.owner_id AND v.id=r.id AND v.version=r.source_version
+             LEFT JOIN embeddings e ON e.owner=v.owner AND e.id=v.id
+             WHERE r.owner_id=? AND r.active=1 ORDER BY r.id"
+        ).bind::<Text, _>(owner).load::<Source>(conn)?;
+        return sources
+            .into_iter()
+            .map(|source| {
+                ensure!(source.id >= 0, "invalid repository id {}", source.id);
+                let hash = match source.fingerprint {
+                    Some(hash) => hash,
+                    None => document_hash(selection, model, &store::by_id(conn, source.id)?, tier),
+                };
+                Ok(Document {
+                    id: source.id,
+                    hash,
+                })
+            })
+            .collect();
+    }
     let mut docs = Vec::new();
     store::visit_repos(conn, |repo| {
         ensure!(repo.id >= 0, "invalid repository id {}", repo.id);
-        let text = document(&repo);
         docs.push(Document {
             id: repo.id,
-            hash: fingerprint(model, &text),
+            hash: document_hash(selection, model, &repo, tier),
         });
         Ok(())
     })?;
@@ -585,6 +753,27 @@ fn checkpoint_vectors(
     )
 }
 
+fn write_checkpoint(
+    db: &mut Db,
+    payloads: &mut Payloads,
+    owner: &str,
+    doc: &Document,
+    vector: &[f32],
+) -> Result<()> {
+    use embedding_checkpoints as t;
+    let reference = payloads.write(&vector_bytes(vector))?;
+    diesel::replace_into(t::table)
+        .values((
+            t::owner.eq(owner),
+            t::id.eq(doc.id),
+            t::fingerprint.eq(&doc.hash),
+            t::vector.eq(Vec::<u8>::new()),
+            t::checksum.eq(reference),
+        ))
+        .execute(db)?;
+    Ok(())
+}
+
 fn clear_checkpoints(db: &mut Db, owner: &str) -> Result<()> {
     diesel::delete(embedding_checkpoints::table.filter(embedding_checkpoints::owner.eq(owner)))
         .execute(db)?;
@@ -640,7 +829,12 @@ fn collect_payloads(db: &mut Db, owner: &str, payloads: &mut Payloads) {
             .filter(embedding_checkpoints::owner.eq(owner))
             .select(embedding_checkpoints::checksum)
             .load::<Vec<u8>>(db)?;
-        payloads.collect_orphans(published.into_iter().chain(pending))
+        use parts::embedding_parts as t;
+        let segments = t::table
+            .filter(t::owner.eq(owner))
+            .select(t::checksum)
+            .load::<Vec<u8>>(db)?;
+        payloads.collect_orphans(published.into_iter().chain(pending).chain(segments))
     });
     if let Err(error) = result {
         eprintln!("清理旧向量文件失败：{error}");
@@ -656,9 +850,18 @@ pub(crate) fn prepare_build(db: &mut Db, rebuild: bool) -> Result<bool> {
         let identity = Selection::read(db)?.identity();
         let previous = store::meta(db, "index_rebuild")?;
         let pending_rebuild = previous.as_deref() == Some(identity.as_str());
-        if rebuild && (!pending_rebuild || store::meta(db, "index_issue")?.is_some()) {
+        let restart_failed = rebuild && store::meta(db, "index_issue")?.is_some();
+        if rebuild && (!pending_rebuild || restart_failed) {
             let owner = store::owner(db)?;
             clear_checkpoints(db, &owner)?;
+            // A fresh rebuild of the published model also repairs a remote model whose
+            // weights changed under the same name. Policy-only changes can reuse parts.
+            if restart_failed
+                || store::meta(db, "index_identity")?.is_none_or(|published| published == identity)
+            {
+                use parts::embedding_parts as t;
+                diesel::delete(t::table.filter(t::owner.eq(&owner))).execute(db)?;
+            }
             store::set_meta(db, "index_rebuild", &identity)?;
         } else if !pending_rebuild && previous.is_some() {
             store::delete_meta(db, "index_rebuild")?;
@@ -685,7 +888,7 @@ impl std::fmt::Display for BuildConflict {
 
 impl std::error::Error for BuildConflict {}
 
-#[derive(Clone, Copy, serde::Deserialize, serde::Serialize)]
+#[derive(Clone, Copy, Default, serde::Deserialize, serde::Serialize)]
 pub(crate) struct Progress {
     pub repositories: usize,
     pub total: usize,
@@ -694,6 +897,16 @@ pub(crate) struct Progress {
     pub chunks: usize,
     pub tokens: Option<usize>,
     pub elapsed_seconds: u64,
+    #[serde(default)]
+    pub tokenizer_ms: u64,
+    #[serde(default)]
+    pub inference_ms: u64,
+    #[serde(default)]
+    pub checkpoint_ms: u64,
+    #[serde(skip)]
+    tokenizer_fraction: Duration,
+    #[serde(skip)]
+    inference_fraction: Duration,
 }
 
 pub(crate) fn build(conn: &mut Db, rebuild: bool, progress: &dyn Fn(&str)) -> Result<String> {
@@ -757,6 +970,59 @@ fn build_observed_with(
     progress: &dyn Fn(&str),
     observe: &dyn Fn(Progress),
 ) -> Result<String> {
+    if let Some(metadata) = Tier::initial(conn, &engine.selection, rebuild)? {
+        progress("正在建立仓库元数据索引");
+        let initial = std::cell::Cell::new(Progress::default());
+        build_stage(conn, dir, rebuild, metadata, engine, progress, &|counts| {
+            initial.set(counts);
+            observe(counts);
+        })?;
+        progress("元数据索引已发布，正在补全正文");
+        engine.check_profile(conn)?;
+        let first = initial.get();
+        return build_stage(
+            conn,
+            dir,
+            false,
+            Tier::Full,
+            engine,
+            progress,
+            &|mut counts| {
+                counts.tokenizer_ms += first.tokenizer_ms;
+                counts.inference_ms += first.inference_ms;
+                accumulate_ms(
+                    &mut counts.tokenizer_ms,
+                    &mut counts.tokenizer_fraction,
+                    first.tokenizer_fraction,
+                );
+                accumulate_ms(
+                    &mut counts.inference_ms,
+                    &mut counts.inference_fraction,
+                    first.inference_fraction,
+                );
+                counts.checkpoint_ms += first.checkpoint_ms;
+                counts.elapsed_seconds += first.elapsed_seconds;
+                counts.chunks += first.chunks;
+                counts.tokens = counts
+                    .tokens
+                    .zip(first.tokens)
+                    .map(|(a, b)| a.saturating_add(b));
+                observe(counts);
+            },
+        );
+    }
+    build_stage(conn, dir, rebuild, Tier::Full, engine, progress, observe)
+}
+
+fn build_stage(
+    conn: &mut Db,
+    dir: &Path,
+    rebuild: bool,
+    tier: Tier,
+    engine: &Engine,
+    progress: &dyn Fn(&str),
+    observe: &dyn Fn(Progress),
+) -> Result<String> {
     let key = engine.selection.identity();
     let owner = store::owner(conn)?;
     conn.batch_execute(SCHEMA)?;
@@ -767,7 +1033,10 @@ fn build_observed_with(
             engine.check_current(db)?;
             let current = build_generation(db, rebuild)?;
             check_model(db, &engine.selection, rebuild)?;
-            let docs = documents(db, &key)?;
+            if let Tier::Metadata(expected) = tier {
+                ensure!(current == expected, BuildConflict);
+            }
+            let docs = documents(db, &owner, &engine.selection, &key, rebuild, tier)?;
             let mut vectors = if rebuild || current == 0 {
                 BTreeMap::new()
             } else {
@@ -797,10 +1066,18 @@ fn build_observed_with(
             ))
         })?;
     let resumed = computed.len();
-    let missing: Vec<_> = docs
+    let mut missing: Vec<_> = docs
         .iter()
         .filter(|doc| !vectors.contains_key(&doc.id))
         .collect();
+    if matches!(tier, Tier::Full)
+        && matches!(
+            engine.selection.policy,
+            crate::chunking::Policy::Structured { .. }
+        )
+    {
+        tier::prioritize_bodies(conn, &owner, &mut missing)?;
+    }
     if !rebuild && missing.is_empty() && resumed == 0 && existing_count == Some(docs.len()) {
         conn.immediate_transaction::<_, anyhow::Error, _>(|db| {
             engine.check_current(db)?;
@@ -808,7 +1085,7 @@ fn build_observed_with(
                 build_generation(db, rebuild)? == current && library_revision(db)? == revision,
                 BuildConflict
             );
-            finish_index(db, &owner, &revision, rebuild)
+            finish_index(db, &owner, &revision, rebuild, tier)
         })?;
         collect_payloads(conn, &owner, &mut payloads);
         observe(Progress {
@@ -818,7 +1095,7 @@ fn build_observed_with(
             resumed: 0,
             chunks: 0,
             tokens: Some(0),
-            elapsed_seconds: 0,
+            ..Progress::default()
         });
         return Ok(format!("索引已是最新，共 {} 个仓库", docs.len()));
     }
@@ -831,11 +1108,33 @@ fn build_observed_with(
         resumed,
         chunks: 0,
         tokens: Some(0),
-        elapsed_seconds: 0,
+        ..Progress::default()
     };
+    let mut checkpoint_time = Duration::ZERO;
     progress("正在计算仓库向量");
     observe(counts);
-    for group in missing.chunks(BATCH) {
+    for group in missing.chunks(engine.group_size()) {
+        if matches!(
+            engine.selection.policy,
+            crate::chunking::Policy::Structured { .. }
+        ) {
+            let mut builder = parts::Build {
+                engine,
+                owner: &owner,
+                generation: current,
+                revision: &revision,
+                tier,
+                checkpoint_time: &mut checkpoint_time,
+                rebuild,
+                payloads: &mut payloads,
+                started: start,
+                observe,
+            };
+            let built = builder.run(conn, group, &mut counts)?;
+            computed.extend(built.keys().copied());
+            vectors.extend(built);
+            continue;
+        }
         // Do not hold a SQLite transaction during inference.
         let mut means: Vec<_> = (0..group.len()).map(|_| mean::Mean::default()).collect();
         let mut batch = Vec::with_capacity(BATCH);
@@ -846,10 +1145,7 @@ fn build_observed_with(
                          finished: &mut Vec<bool>|
          -> Result<()> {
             embed_fragments(db, engine, batch, means, &mut |tokens| {
-                counts.tokens = counts
-                    .tokens
-                    .zip(tokens)
-                    .map(|(total, batch)| total.saturating_add(batch));
+                counts.add_embedding(tokens);
                 counts.elapsed_seconds = start.elapsed().as_secs();
                 observe(counts);
             })?;
@@ -860,26 +1156,18 @@ fn build_observed_with(
                 .map(|((idx, _), _)| Ok((group[*idx], std::mem::take(&mut means[*idx]).finish()?)))
                 .collect::<Result<_>>()?;
             if !completed.is_empty() {
+                let writing = std::time::Instant::now();
                 // Checkpoints are invisible to search until the entire projection commits.
                 db.immediate_transaction::<_, anyhow::Error, _>(|db| {
                     engine.check_current(db)?;
                     ensure!(build_generation(db, rebuild)? == current, BuildConflict);
-                    use embedding_checkpoints as t;
                     for (doc, vector) in &completed {
-                        let bytes = vector_bytes(vector);
-                        let reference = payloads.write(&bytes)?;
-                        diesel::replace_into(t::table)
-                            .values((
-                                t::owner.eq(&owner),
-                                t::id.eq(doc.id),
-                                t::fingerprint.eq(&doc.hash),
-                                t::vector.eq(Vec::<u8>::new()),
-                                t::checksum.eq(reference),
-                            ))
-                            .execute(db)?;
+                        write_checkpoint(db, &mut payloads, &owner, doc, vector)?;
                     }
                     Ok(())
                 })?;
+                checkpoint_time += writing.elapsed();
+                counts.checkpoint_ms = checkpoint_time.as_millis() as u64;
             }
             counts.chunks += batch.len();
             counts.repositories += completed.len();
@@ -989,6 +1277,9 @@ fn build_observed_with(
                 ))
                 .execute(db)?;
         }
+        diesel::sql_query("DELETE FROM embedding_parts WHERE owner = ? AND NOT EXISTS (
+            SELECT 1 FROM repositories r WHERE r.owner_id = embedding_parts.owner AND r.id = embedding_parts.id AND r.active = 1)")
+            .bind::<diesel::sql_types::Text, _>(&owner).execute(db)?;
         store::set_meta(db, "index_generation", &next.to_string())?;
         store::set_meta(db, "index_model", engine.selection.provider.model())?;
         store::set_meta(db, "index_backend", engine.selection.provider.name())?;
@@ -1004,7 +1295,7 @@ fn build_observed_with(
             store::set_meta(db, "index_dimension", &dimension.to_string())?;
         }
         store::set_meta(db, "index_published_at", &Utc::now().to_rfc3339())?;
-        finish_index(db, &owner, &revision, rebuild)?;
+        finish_index(db, &owner, &revision, rebuild, tier)?;
         Ok(format!(
             "索引已更新，共 {} 个仓库，新计算 {} 个，复用 {} 个",
             docs.len(),
@@ -1013,16 +1304,44 @@ fn build_observed_with(
         ))
     })?;
     collect_payloads(conn, &owner, &mut payloads);
+    exact::prime(
+        &artifact_path(dir, &owner, next),
+        &owner,
+        next,
+        &key,
+        &vectors,
+        &mut payloads,
+    );
     Ok(report)
 }
 
-fn finish_index(db: &mut Db, owner: &str, revision: &str, rebuild: bool) -> Result<()> {
+fn finish_index(db: &mut Db, owner: &str, revision: &str, rebuild: bool, tier: Tier) -> Result<()> {
+    use diesel::sql_types::Text;
+    diesel::sql_query(
+        "DELETE FROM index_source_versions WHERE owner=? AND NOT EXISTS (
+        SELECT 1 FROM repositories r WHERE r.owner_id=index_source_versions.owner
+        AND r.id=index_source_versions.id AND r.active=1)",
+    )
+    .bind::<Text, _>(owner)
+    .execute(db)?;
+    diesel::sql_query(
+        "INSERT INTO index_source_versions(owner,id,version)
+        SELECT owner_id,id,source_version FROM repositories WHERE owner_id = ? AND active=1
+        ON CONFLICT(owner,id) DO UPDATE SET version=excluded.version WHERE version<>excluded.version",
+    )
+    .bind::<Text, _>(owner)
+    .execute(db)?;
+    store::set_meta(db, "index_source_versions", "1")?;
     store::set_meta(db, "indexed_library_revision", revision)?;
     clear_checkpoints(db, owner)?;
     if rebuild {
         store::delete_meta(db, "index_rebuild")?;
     }
-    if store::meta(db, "index_rebuild")?.is_none() {
+    if matches!(tier, Tier::Metadata(_)) {
+        store::set_meta(db, "index_body_pending", "1")?;
+        store::set_meta(db, "index_pending", "1")?;
+    } else if store::meta(db, "index_rebuild")?.is_none() {
+        store::delete_meta(db, "index_body_pending")?;
         store::delete_meta(db, "index_pending")?;
         store::delete_meta(db, "index_issue")?;
     }
@@ -1034,7 +1353,7 @@ fn embed_fragments(
     engine: &Engine,
     batch: &[(usize, String)],
     means: &mut [mean::Mean],
-    observed: &mut dyn FnMut(Option<usize>),
+    observed: &mut dyn FnMut(EmbeddingWork),
 ) -> Result<()> {
     let texts: Vec<_> = batch.iter().map(|(_, text)| text.as_str()).collect();
     let vectors = engine.embed(db, &texts, observed)?;
@@ -1045,7 +1364,7 @@ fn embed_fragments(
     Ok(())
 }
 
-fn inferred_filter(query: &str, explicit: &Filter, today: NaiveDate) -> Filter {
+pub(crate) fn inferred_filter(query: &str, explicit: &Filter, today: NaiveDate) -> Filter {
     let mut filter = explicit.clone();
     let q = query.to_lowercase();
     let year = if q.contains("去年") || q.contains("last year") {
@@ -1088,16 +1407,14 @@ fn inferred_filter(query: &str, explicit: &Filter, today: NaiveDate) -> Filter {
     filter
 }
 
-pub(crate) fn search(
-    conn: &mut Db,
-    query: &str,
-    filter: &Filter,
-    limit: usize,
-) -> Result<Vec<Repo>> {
-    search_with_timeout(conn, query, filter, limit, Duration::from_secs(180))
+#[cfg(test)]
+fn search(conn: &mut Db, query: &str, filter: &Filter, limit: usize) -> Result<Vec<Repo>> {
+    let dir = store::data_dir(conn)?;
+    let engine = Engine::configured(conn, Duration::from_secs(180))?;
+    search_with(conn, &dir, query, filter, limit, &engine)
 }
 
-pub(crate) fn search_with_timeout(
+pub(crate) fn hybrid_search(
     conn: &mut Db,
     query: &str,
     filter: &Filter,
@@ -1106,13 +1423,26 @@ pub(crate) fn search_with_timeout(
 ) -> Result<Vec<Repo>> {
     let dir = store::data_dir(conn)?;
     let engine = Engine::configured(conn, timeout)?;
-    search_with(conn, &dir, query, filter, limit, &engine)
+    let depth = limit.max(50);
+    search_ranked(
+        conn,
+        &dir,
+        query,
+        filter,
+        depth,
+        &engine,
+        |db, semantic, filter| {
+            let keywords = store::keyword_search(db, query, filter, depth)?;
+            Ok(crate::library::fuse(semantic, keywords, limit))
+        },
+    )
 }
 
 pub(crate) fn has_published_generation(db: &mut Db) -> Result<bool> {
     Ok(generation(db)? > 0)
 }
 
+#[cfg(test)]
 fn search_with(
     conn: &mut Db,
     dir: &Path,
@@ -1120,6 +1450,20 @@ fn search_with(
     filter: &Filter,
     limit: usize,
     engine: &Engine,
+) -> Result<Vec<Repo>> {
+    search_ranked(conn, dir, query, filter, limit, engine, |_, rows, _| {
+        Ok(rows)
+    })
+}
+
+fn search_ranked(
+    conn: &mut Db,
+    dir: &Path,
+    query: &str,
+    filter: &Filter,
+    limit: usize,
+    engine: &Engine,
+    finish: impl FnOnce(&mut Db, Vec<Repo>, &Filter) -> Result<Vec<Repo>>,
 ) -> Result<Vec<Repo>> {
     let query = query.trim();
     ensure!(!query.is_empty(), "请输入检索词");
@@ -1139,35 +1483,23 @@ fn search_with(
         let current = generation(db)?;
         check_model(db, &engine.selection, false)?;
         ensure!(current > 0, "尚未建立语义索引，请运行 starstack index");
-        let projection = open_projection(
-            &artifact_path(dir, &owner, current),
-            current,
-            &owner,
-            &key,
-        )
-        .context(
-            "无法打开语义索引，请运行 starstack index 修复，或运行 starstack index --rebuild 重建",
-        )?;
+        let search = exact::Search::open(dir, &owner, current, &key, &allowed)?;
         let revision = library_revision(db)?;
-        if revision == "0"
+        if store::meta(db, "index_source_versions")?.is_some() {
+            check_source_versions(db, &owner, &allowed)?;
+        } else if revision == "0"
             || store::meta(db, "indexed_library_revision")?.as_deref() != Some(&revision)
         {
-            check_fingerprints(db, &owner, &key, &allowed)?;
+            check_fingerprints(db, &owner, &engine.selection, &key, &allowed)?;
         }
         let lists_revision = if filter.list.is_some() {
             store::meta(db, "lists_revision")?
         } else {
             None
         };
-        Ok(Some((
-            allowed,
-            projection,
-            current,
-            revision,
-            lists_revision,
-        )))
+        Ok(Some((allowed, search, current, revision, lists_revision)))
     })?;
-    let Some((allowed, projection, current, revision, lists_revision)) = snapshot else {
+    let Some((allowed, search, current, revision, lists_revision)) = snapshot else {
         return Ok(Vec::new());
     };
 
@@ -1186,18 +1518,6 @@ fn search_with(
         .embed(conn, &[&prompt], &mut |_| {})?
         .pop()
         .context("missing query embedding")?;
-    ensure!(
-        projection.manifest().dimension == vector.len(),
-        "查询向量的维度与索引不同，请检查模型并运行 starstack index --rebuild"
-    );
-    let candidates = projection
-        .search(
-            &vector,
-            limit.saturating_mul(4).min(allowed.len()),
-            ProjectionSearchOptions::default().with_allowed_ids(&allowed),
-        )
-        .context("查找向量失败，请检查嵌入模型或运行 starstack index --rebuild")?;
-
     conn.transaction(|db| {
         engine.check_current(db)?;
         ensure!(
@@ -1206,34 +1526,16 @@ fn search_with(
                 && (filter.list.is_none() || store::meta(db, "lists_revision")? == lists_revision),
             "查询期间收藏资料已更新，请重试查询"
         );
-        let mut payloads = Payloads::new(dir, &owner);
-        let mut ranked = Vec::with_capacity(candidates.hits.len());
-        for hit in candidates.hits {
-            let id = i64::try_from(hit.id)?;
-            let (bytes, checksum) = embeddings::table
-                .find((&owner, id))
-                .select((embeddings::vector, embeddings::checksum))
-                .first::<(Vec<u8>, Vec<u8>)>(db)?;
-            let bytes = payloads
-                .read(bytes, &checksum)
-                .context("无法读取原始向量，请运行 starstack index 修复")?;
-            let stored = decode(&bytes)?;
-            ensure!(
-                vector.len() == stored.len(),
-                "缓存向量维度不一致，请运行 starstack index --rebuild"
-            );
-            ranked.push((id, cosine(&vector, &stored)));
-        }
-        ranked.sort_unstable_by(|(a_id, a), (b_id, b)| b.total_cmp(a).then(a_id.cmp(b_id)));
-        ranked.truncate(limit);
-        ranked
+        let ranked = search.rank(db, dir, &allowed, &vector, limit)?;
+        let semantic = ranked
             .into_iter()
             .map(|(id, score)| {
                 let mut repo = store::by_id(db, id)?;
                 repo.score = Some(score);
                 Ok(repo)
             })
-            .collect()
+            .collect::<Result<_>>()?;
+        finish(db, semantic, &filter)
     })
 }
 
@@ -1264,7 +1566,35 @@ impl std::fmt::Display for Stale {
 
 impl std::error::Error for Stale {}
 
-fn check_fingerprints(db: &mut Db, owner: &str, model: &str, allowed: &[u64]) -> Result<()> {
+fn check_source_versions(db: &mut Db, owner: &str, allowed: &[u64]) -> Result<()> {
+    use diesel::sql_types::{BigInt, Text};
+    #[derive(QueryableByName)]
+    struct Changed {
+        #[diesel(sql_type = BigInt)]
+        id: i64,
+    }
+    let changes = diesel::sql_query(
+        "SELECT r.id AS id FROM repositories r
+         LEFT JOIN index_source_versions v ON v.owner=r.owner_id AND v.id=r.id
+         WHERE r.owner_id=? AND r.active=1 AND (v.version IS NULL OR v.version<>r.source_version)",
+    )
+    .bind::<Text, _>(owner)
+    .load_iter::<Changed, _>(db)?;
+    for row in changes {
+        if allowed.binary_search(&u64::try_from(row?.id)?).is_ok() {
+            return Err(Stale.into());
+        }
+    }
+    Ok(())
+}
+
+fn check_fingerprints(
+    db: &mut Db,
+    owner: &str,
+    selection: &Selection,
+    model: &str,
+    allowed: &[u64],
+) -> Result<()> {
     let hashes = embeddings::table
         .filter(embeddings::owner.eq(owner))
         .select((embeddings::id, embeddings::fingerprint))
@@ -1274,7 +1604,7 @@ fn check_fingerprints(db: &mut Db, owner: &str, model: &str, allowed: &[u64]) ->
     for &id in allowed {
         let id = i64::try_from(id)?;
         let repo = store::by_id(db, id)?;
-        if hashes.get(&id) != Some(&fingerprint(model, &document(&repo))) {
+        if hashes.get(&id) != Some(&document_hash(selection, model, &repo, Tier::Full)) {
             return Err(Stale.into());
         }
     }

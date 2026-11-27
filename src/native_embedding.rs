@@ -1,4 +1,5 @@
 //! CPU embeddings for BERT sentence encoders and quantized Qwen3-Embedding.
+use crate::index::EmbeddingWork;
 use crate::index::mean::Mean;
 use anyhow::{Context, Result, anyhow, ensure};
 use candle_core::{DType, Device, Tensor};
@@ -7,6 +8,7 @@ use candle_transformers::models::bert::{BertModel, Config};
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
+use std::time::{Duration, Instant};
 
 mod qwen;
 pub(crate) use qwen::PROTOCOL as QWEN_PROTOCOL;
@@ -14,7 +16,7 @@ use tokenizers::{Encoding, PaddingParams, PostProcessor, Tokenizer, TruncationPa
 
 /// Includes the pinned weights, document processor and pooling protocol in the index identity.
 pub(crate) const IDENTITY: &str =
-    "builtin:multilingual-minilm-l12-v2:eaa086f0ffee582a:masked-mean-128-stride24-v2";
+    "builtin:multilingual-minilm-l12-v2:eaa086f0ffee582a:masked-mean-128-stride24-v3";
 
 const DIMENSION: usize = 384;
 const MAX_TOKENS: usize = 128;
@@ -128,7 +130,7 @@ pub(crate) fn embed(
     dir: &Path,
     family: &str,
     texts: &[&str],
-    observed: &mut dyn FnMut(usize),
+    observed: &mut dyn FnMut(EmbeddingWork),
 ) -> Result<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Ok(Vec::new());
@@ -152,12 +154,14 @@ pub(crate) fn embed(
 fn embed_bert(
     encoder: &Encoder,
     texts: &[&str],
-    observed: &mut dyn FnMut(usize),
+    observed: &mut dyn FnMut(EmbeddingWork),
 ) -> Result<Vec<Vec<f32>>> {
+    let started = Instant::now();
     let encodings = encoder
         .tokenizer
         .encode_batch(texts.to_vec(), true)
         .map_err(|e| anyhow!("本地分词失败（{e}）"))?;
+    observed(EmbeddingWork::tokenized(started.elapsed()));
     let mut means: Vec<_> = (0..texts.len()).map(|_| Mean::default()).collect();
     let mut original_vectors = Vec::new();
     let mut windows = Vec::new();
@@ -165,7 +169,7 @@ fn embed_bert(
         let rest = first.take_overflowing();
         for window in std::iter::once(first).chain(rest) {
             let ordinal = original_vectors.len();
-            original_vectors.push((text, None));
+            original_vectors.push((text, window.len(), None));
             windows.push((ordinal, window));
         }
     }
@@ -179,14 +183,20 @@ fn embed_bert(
     }
     for batch in windows.chunks_mut(16) {
         let tokens: usize = batch.iter().map(|(_, window)| window.len()).sum();
+        let started = Instant::now();
         let vectors = infer_batch(encoder, batch)?;
+        let inference = started.elapsed();
         for ((ordinal, _), vector) in batch.iter().zip(vectors) {
-            original_vectors[*ordinal].1 = Some(vector);
+            original_vectors[*ordinal].2 = Some(vector);
         }
-        observed(tokens);
+        observed(EmbeddingWork {
+            tokens: Some(tokens),
+            tokenizer: Duration::ZERO,
+            inference,
+        });
     }
-    for (text, vector) in original_vectors {
-        means[text].push(&vector.context("缺少内置模型窗口向量")?)?;
+    for (text, tokens, vector) in original_vectors {
+        means[text].push_weighted(&vector.context("缺少内置模型窗口向量")?, tokens as f64)?;
     }
     means.into_iter().map(Mean::finish).collect()
 }

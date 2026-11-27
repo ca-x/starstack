@@ -22,7 +22,7 @@ function RepoRow({ repo, open, source }: { repo: Repo; open: () => void; source?
       </div>}
       <div className="metadata">
         {typeof repo.score === "number" && Number.isFinite(repo.score) &&
-          <span className="match-score" title={t("余弦相似度")}>{t("相关度 {0}", repo.score.toFixed(3))}</span>}
+          <span className="match-score" title={t("余弦相似度")}>{t("语义相似度 {0}", repo.score.toFixed(3))}</span>}
         {repo.language && <Language name={repo.language} />}
         <span aria-label={t("{0} 个 Star", repo.stargazers_count)}><Icon type="starEmpty" />{repo.stargazers_count.toLocaleString()}</span>
         <span>{t("收藏于")} {date(repo.starred_at)}</span>
