@@ -374,17 +374,31 @@ fn valid(vector: &[f32]) -> bool {
 }
 
 fn document(repo: &Repo) -> String {
-    format!(
-        "Repository: {}\nDescription: {}\nLanguage: {}\nTopics: {}\nLicense: {}\nTags: {}\nNote: {}\nREADME: {}",
+    let mut text = format!(
+        "Repository: {}\nDescription: {}\nLanguage: {}\nTopics: {}\nLicense: {}\nTags: {}\nNote: {}",
         repo.full_name,
         repo.description.as_deref().unwrap_or(""),
         repo.language.as_deref().unwrap_or(""),
         repo.topics.join(", "),
         repo.license.as_deref().unwrap_or(""),
         repo.tags.join(", "),
-        repo.note,
-        repo.readme
-    )
+        repo.note
+    );
+    for (label, content) in [
+        ("Saved summary", &repo.summary),
+        ("Saved code", &repo.code_context),
+    ] {
+        if !content.is_empty() {
+            text.push_str(&format!("\n{label}: {content}"));
+        }
+    }
+    if !repo.commit_index.is_empty() {
+        text.push_str("\nRecent commits: ");
+        text.push_str(&repo.commit_index);
+    }
+    text.push_str("\nREADME: ");
+    text.push_str(&repo.readme);
+    text
 }
 
 fn fingerprint(model: &str, text: &str) -> Vec<u8> {

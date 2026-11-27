@@ -1,6 +1,6 @@
 //! Explicit instance-wide configuration for generative AI, separate from embeddings.
 use crate::store::{self, Db};
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -19,6 +19,28 @@ fn env(name: &str) -> Option<String> {
 
 impl Config {
     fn validate(&self) -> Result<()> {
+        self.validate_endpoint()?;
+        if !self.provider.is_empty() {
+            ensure!(
+                !self.model.trim().is_empty() && self.model.len() <= 256,
+                "请填写聊天模型名称"
+            );
+        }
+        Ok(())
+    }
+
+    fn provider(&self) -> Result<std::sync::Arc<dyn aimux_core::provider::Provider>> {
+        Ok(aimux_providers::create_provider(
+            &self.provider,
+            aimux_providers::PresetSettings {
+                api_key: self.api_key.clone().map(Into::into),
+                base_url: self.base_url.clone(),
+                ..Default::default()
+            },
+        )?)
+    }
+
+    fn validate_endpoint(&self) -> Result<()> {
         if self.provider.is_empty() {
             return Ok(());
         }
@@ -29,10 +51,6 @@ impl Config {
                     .bytes()
                     .all(|b| b.is_ascii_alphanumeric() || b == b'-'),
             "聊天服务商名称无效"
-        );
-        ensure!(
-            !self.model.trim().is_empty() && self.model.len() <= 256,
-            "请填写聊天模型名称"
         );
         ensure!(
             self.provider != "ollama" || self.base_url.is_some(),
@@ -105,12 +123,7 @@ pub(crate) struct Input {
     #[serde(default)]
     clear_key: bool,
 }
-pub(crate) fn update(db: &mut Db, input: Input) -> Result<()> {
-    use store::metadata_values as m;
-    ensure!(
-        env("STARSTACK_AI_PROVIDER").is_none(),
-        "聊天服务已由环境变量配置"
-    );
+pub(crate) fn draft(db: &mut Db, input: Input) -> Result<Config> {
     let old = saved(db)?;
     let provider = input.provider.trim().to_lowercase();
     let base_url = input
@@ -123,7 +136,7 @@ pub(crate) fn update(db: &mut Db, input: Input) -> Result<()> {
         key = old.api_key;
     }
     ensure!(key.as_ref().is_none_or(|s| s.len() <= 8192), "API 密钥过长");
-    let cfg = if provider.is_empty() {
+    Ok(if provider.is_empty() {
         Config::default()
     } else {
         Config {
@@ -132,17 +145,40 @@ pub(crate) fn update(db: &mut Db, input: Input) -> Result<()> {
             base_url,
             api_key: key,
         }
-    };
+    })
+}
+
+pub(crate) async fn models(cfg: Config) -> Result<Vec<String>> {
+    ensure!(!cfg.provider.is_empty(), "请选择聊天服务商");
+    cfg.validate_endpoint()?;
+    let provider = cfg
+        .provider()
+        .map_err(|_| anyhow::anyhow!("无法连接聊天服务，请检查服务商、地址和 API 密钥"))?;
+    let discovery = provider.discovery().context("该聊天服务不提供模型列表")?;
+    let models = tokio::time::timeout(std::time::Duration::from_secs(12), discovery.list_models())
+        .await
+        .context("获取模型列表超时，请重试")?
+        .map_err(|_| anyhow::anyhow!("无法获取模型列表，请检查服务地址和 API 密钥"))?;
+    let mut ids: Vec<_> = models
+        .into_iter()
+        .map(|model| model.id)
+        .filter(|id| !id.trim().is_empty() && id.len() <= 256)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(ids)
+}
+
+pub(crate) fn update(db: &mut Db, input: Input) -> Result<()> {
+    use store::metadata_values as m;
+    ensure!(
+        env("STARSTACK_AI_PROVIDER").is_none(),
+        "聊天服务已由环境变量配置"
+    );
+    let cfg = draft(db, input)?;
     cfg.validate()?;
     if !cfg.provider.is_empty() {
-        aimux_providers::create_provider(
-            &cfg.provider,
-            aimux_providers::PresetSettings {
-                api_key: cfg.api_key.clone().map(Into::into),
-                base_url: cfg.base_url.clone(),
-                ..Default::default()
-            },
-        )?;
+        cfg.provider()?;
     }
     let value = serde_json::to_string(&cfg)?;
     diesel::insert_into(m::table)

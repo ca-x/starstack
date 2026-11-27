@@ -11,6 +11,7 @@ export interface Repo {
   archived: boolean;
   tags: string[];
   note: string;
+  summary?: string;
   pinned: boolean;
   score?: number;
 }

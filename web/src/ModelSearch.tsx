@@ -30,8 +30,9 @@ function SearchResult({ hit, model, admin, refresh }: { hit: Hit; model?: ModelF
   </li>;
 }
 
-export function ModelSearch({ admin, models, refresh }: { admin: boolean; models: ModelFile[]; refresh: () => void }) {
-  const [source, setSource] = useState("modelscope");
+export function ModelSearch({ admin, models, source, changeSource, refresh }: {
+  admin: boolean; models: ModelFile[]; source: string; changeSource: (source: string) => void; refresh: () => void;
+}) {
   const [query, setQuery] = useState("");
   const [results, setResults] = useState<Hit[]>();
   const [format, setFormat] = useState("");
@@ -54,13 +55,14 @@ export function ModelSearch({ admin, models, refresh }: { admin: boolean; models
   }
   const formats = [...new Set(results?.map(h => h.format).filter((item): item is string => !!item))].sort();
   const visible = results?.filter(item => (!format || item.format === format) && (!verified || !!item.model_id));
-  return <details className="model-endpoints"><summary>{t("搜索模型仓库")}</summary>
-    <form className="model-selector" onSubmit={search}>
-      <EuiFormRow label={t("搜索来源")} fullWidth><EuiSelect fullWidth disabled={busy} value={source}
+  return <div className="market-search"><form className="market-search-form" onSubmit={search}>
+      <EuiFormRow label={t("仓库名称或关键词")} fullWidth>
+        <EuiFieldText fullWidth type="search" placeholder={t("例如 MiniLM 或 Qwen3 Embedding")} value={query} disabled={busy}
+          onChange={e => setQuery(e.target.value)} />
+      </EuiFormRow>
+      <EuiFormRow label={t("模型仓库")} fullWidth><EuiSelect fullWidth disabled={busy} value={source}
         options={[{ value: "modelscope", text: t("魔搭 ModelScope") }, { value: "huggingface", text: "Hugging Face" }]}
-        onChange={e => { setSource(e.target.value); setResults(undefined); setError(""); }} /></EuiFormRow>
-      <EuiFormRow label={t("仓库名称或关键词")} fullWidth><EuiFieldText fullWidth type="search" required value={query} disabled={busy}
-        onChange={e => setQuery(e.target.value)} /></EuiFormRow>
+        onChange={e => { changeSource(e.target.value); setResults(undefined); setError(""); }} /></EuiFormRow>
       <EuiButton type="submit" isLoading={busy} isDisabled={busy || !query.trim()}>{t("搜索仓库")}</EuiButton>
     </form>
     {error && <Failure error={error} />}
@@ -69,8 +71,8 @@ export function ModelSearch({ admin, models, refresh }: { admin: boolean; models
         <EuiSelect compressed aria-label={t("模型格式")} value={format} options={[{ value: "", text: t("全部格式") }, ...formats.map(f => ({ value: f, text: f }))]} onChange={e => setFormat(e.target.value)} />
         <EuiCheckbox id="model-search-verified" label={t("仅可直接安装")} checked={verified} onChange={e => setVerified(e.target.checked)} />
       </div></>}
-      {visible?.length ? <ul>{visible.map(hit => <SearchResult key={`${hit.source}/${hit.repository}`} hit={hit} model={models.find(m => m.id === hit.model_id)}
+      {visible?.length ? <ul className="model-grid">{visible.map(hit => <SearchResult key={`${hit.source}/${hit.repository}`} hit={hit} model={models.find(m => m.id === hit.model_id)}
         admin={admin} refresh={refresh} />)}</ul> : <p role="status">{results.length ? t("没有符合筛选条件的模型。") : t("没有找到模型仓库。")}</p>}
     </div>}
-  </details>;
+  </div>;
 }

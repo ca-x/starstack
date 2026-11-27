@@ -152,6 +152,42 @@ enum Update {
     Custom { url: String },
 }
 
+pub(crate) fn test_connection(db: &mut Db, input: Value, revision: i32) -> Result<Value> {
+    require_admin(db, Some(revision))?;
+    let operator = operator_url()?;
+    let config = if input.is_null() || operator.is_some() {
+        effective(db, operator)?.0
+    } else {
+        let update: Update =
+            serde_json::from_value(input).map_err(|_| anyhow!("代理设置格式无效"))?;
+        match update {
+            Update::System => ProxyConfig::System,
+            Update::Direct => ProxyConfig::Direct,
+            Update::Custom { url } => ProxyConfig::custom(url.trim())?,
+        }
+    };
+    let start = std::time::Instant::now();
+    let response = config
+        .blocking_builder()?
+        .timeout(std::time::Duration::from_secs(10))
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .and_then(|client| client.head("https://www.cloudflare.com/").send())
+        .map_err(|e| {
+            if e.is_timeout() {
+                anyhow!("连接 Cloudflare 超时，请检查代理地址和网络")
+            } else {
+                anyhow!("无法访问 Cloudflare，请检查代理地址、认证信息和网络")
+            }
+        })?;
+    ensure!(
+        response.status().is_success() || response.status().is_redirection(),
+        "Cloudflare 返回 HTTP {}，请检查代理或等待后重试",
+        response.status().as_u16()
+    );
+    Ok(json!({"elapsed_ms": start.elapsed().as_millis()}))
+}
+
 pub(crate) fn save_settings(db: &mut Db, input: Value, revision: i32) -> Result<Value> {
     persist(db, input, revision, operator_url()?)
 }

@@ -1,10 +1,37 @@
 import { t } from "./locale";
 import { useEffect, useState, type FormEvent } from "react";
-import { EuiButton, EuiButtonEmpty, EuiFieldText, EuiFormRow } from "@elastic/eui";
+import { EuiButton, EuiButtonEmpty, EuiFieldText, EuiFormRow, EuiSwitch } from "@elastic/eui";
 import { api, date, message } from "./api";
 import { Failure } from "./shared";
 
 interface Token { id: string; name: string; created_at: string }
+
+function ModelPreference() {
+  const [enabled, setEnabled] = useState<boolean>();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState("");
+  const [revision, setRevision] = useState(0);
+  useEffect(() => {
+    const controller = new AbortController();
+    api<{ use_chat: boolean }>("mcp/settings", undefined, controller.signal)
+      .then(data => { if (!controller.signal.aborted) setEnabled(data.use_chat); })
+      .catch(e => { if (!controller.signal.aborted) setError(message(e)); });
+    return () => controller.abort();
+  }, [revision]);
+  async function update(useChat: boolean) {
+    setBusy(true); setError("");
+    try {
+      const data = await api<{ use_chat: boolean }>("mcp/settings", { use_chat: useChat });
+      setEnabled(data.use_chat);
+    } catch (e) { setError(message(e)); } finally { setBusy(false); }
+  }
+  return <section className="operation">
+    <div><h2>{t("检索与推荐")}</h2><p>{t("MCP 自动使用此账号的语义索引。开启后，聊天模型先为原问题补充检索词，再根据最多五个仓库的名称、描述及语言生成建议。")}</p></div>
+    <EuiSwitch label={t("在 MCP 检索中使用 AI 聊天模型")} checked={enabled ?? false}
+      disabled={enabled === undefined || busy} onChange={event => update(event.target.checked)} />
+    {error && <Failure error={error} retry={enabled === undefined ? () => { setError(""); setRevision(n => n + 1); } : undefined} />}
+  </section>;
+}
 
 export function Mcp() {
   const [tokens, setTokens] = useState<Token[]>([]);
@@ -49,6 +76,7 @@ export function Mcp() {
     <div className="operations">
       <section className="operation"><h2>{t("连接地址")}</h2><code className="endpoint">{location.origin}/mcp</code>
         <p>{t("在客户端设置请求头")}<code>{t("Authorization: Bearer <令牌>")}</code></p></section>
+      <ModelPreference />
       <section className="operation"><h2>{t("访问令牌")}</h2>
         {secret ? <div className="token-secret"><EuiFormRow label={t("新令牌")} helpText={t("完整令牌仅在这里显示一次，请复制并妥善保存。")} fullWidth>
           <EuiFieldText fullWidth value={secret} readOnly onFocus={e => e.target.select()} /></EuiFormRow>

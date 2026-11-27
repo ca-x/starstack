@@ -52,6 +52,35 @@ impl Summary {
             self.failure_examples.push(message);
         }
     }
+
+    pub(crate) fn web_report(&self, catalog: bool) -> (String, Vec<String>, Vec<String>) {
+        let mut warnings = Vec::new();
+        let message = if catalog {
+            format!(
+                "新增 {}，更新 {}，取消收藏 {}，无需变更 {}",
+                self.added, self.updated, self.removed, self.skipped
+            )
+        } else {
+            format!(
+                "本轮已补全 {} 个 README，待补全 {}",
+                self.readmes_fetched, self.pending_readmes
+            )
+        };
+        if self.failed > 0 {
+            warnings.push(format!("{} 项同步失败。可运行全量同步重试。", self.failed));
+        }
+        if self.readme_failures > 0 {
+            warnings.push(format!(
+                "{} 个 README 抓取失败，将在后续任务中重试。",
+                self.readme_failures
+            ));
+        }
+        let mut details = self.failure_examples.clone();
+        if let Some(reason) = &self.readme_pause {
+            details.insert(0, reason.clone());
+        }
+        (message, warnings, details)
+    }
 }
 
 impl fmt::Display for Summary {
@@ -150,6 +179,9 @@ impl Star {
             readme: String::new(),
             tags: Vec::new(),
             note: String::new(),
+            summary: String::new(),
+            code_context: String::new(),
+            commit_index: String::new(),
             pinned: false,
             score: None,
         }

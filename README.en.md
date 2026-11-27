@@ -37,7 +37,9 @@ Ask “What was that Rust parser I starred last year?” StarStack searches your
 
 ## Dashboard and Docker
 
-On first launch, set `STARSTACK_ADMIN_USER` and `STARSTACK_ADMIN_PASSWORD` (at least eight bytes). Run `starstack serve` and open <http://127.0.0.1:8080/login>. **Sync & index** connects your GitHub account and manages refreshes. Search, filter and edit notes from the library. Display preferences on the login page and dashboard control language and theme.
+Run `starstack serve` and open <http://127.0.0.1:8080/login>. Choose a username and password to create the first administrator. For unattended setup, set both `STARSTACK_ADMIN_USER` and `STARSTACK_ADMIN_PASSWORD` before the first launch.
+
+**Sync & index** has tabs for star sync, schedule and quotas, semantic indexing, the model market, and AI chat. The GitHub connection panel lets you reauthorize or disconnect. The AI chat form loads available models based on the selected provider, URL and API key.
 
 For Docker, put the following variables in a local `.env` next to `compose.yaml`, replace the placeholders, then run `docker compose up -d --build`. The named volume keeps the library and model files across container recreation. The default published port binds to localhost. To download the search model inside the container, run `docker compose exec starstack starstack models download --source huggingface`.
 
@@ -49,7 +51,9 @@ STARSTACK_GITHUB_SCOPE=
 STARSTACK_SYNC_INTERVAL_MINUTES=360
 ```
 
-Admins can create and disable users, reset passwords and change roles. Each signed-in user has an independent collection, GitHub authorization, sync schedule and MCP tokens in the shared SQLite database. Password and role changes invalidate that user's sessions and MCP tokens. The local CLI and stdio transport use the initial administrator's library. For other users, connect over HTTP using the token issued by their account. [Deployment guide](docs/deploy.md)
+Admins can create, disable or delete other accounts, reset their passwords and change roles. Each signed-in user has an independent collection, GitHub authorization, sync schedule and MCP tokens in the shared SQLite database. Password and role changes invalidate that user's sessions and MCP tokens. The local CLI and stdio transport use the initial administrator's library. For other users, connect over HTTP using the token issued by their account. [Deployment guide](docs/deploy.md)
+
+In a repository’s detail panel, generate a summary draft, edit it, and save it locally. Ask follow-up questions about the code and review the source paths cited in each answer. Code Q&A sends selected source and README excerpts to the configured chat provider. Saved summaries are indexed, and you can choose which code excerpts to keep in the index. For regression investigation, opt in to commit tracking on individual repositories. Fetch 20 commits by default or choose all available default-branch history. Previously observed SHA records are kept when a baseline check detects a rewrite. The latest 100 commit messages are included in semantic search.
 
 ### Built-in and remote search models
 

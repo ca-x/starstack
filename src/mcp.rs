@@ -12,6 +12,12 @@ use rmcp::{
 };
 use serde_json::json;
 
+pub(crate) const USE_CHAT: &str = "mcp_use_chat";
+
+pub(crate) fn chat_enabled(db: &mut store::Db) -> Result<bool> {
+    Ok(store::meta(db, USE_CHAT)?.as_deref() == Some("1"))
+}
+
 #[derive(Clone)]
 pub(crate) struct Mcp {
     library: Library,
@@ -35,14 +41,69 @@ fn reply(result: Result<serde_json::Value>) -> CallToolResult {
 #[tool_router]
 impl Mcp {
     #[tool(
-        description = "Search this user's starred repositories by natural-language intent. Optional date, language, GitHub List (list), GitHub topic, private tag, archive and pin filters. Cite html_url and include useful private notes in the recommendation."
+        description = "Search this user's starred repositories by natural-language intent. Optional date, language, GitHub List (list), GitHub topic, private tag, archive and pin filters. Cite html_url and include useful private notes in the recommendation. If the user has enabled server-side AI, the response may also include a generated answer."
     )]
     async fn search_stars(&self, Parameters(q): Parameters<Query>) -> CallToolResult {
-        reply(
-            self.library
-                .run(move |db| Ok(json!({"repositories":library::cards(library::search(db,&q)?)})))
-                .await,
-        )
+        if let Err(error) = q.validate() {
+            return reply(Err(error));
+        }
+        let use_chat = match self.library.run(chat_enabled).await {
+            Ok(value) => value,
+            Err(error) => return reply(Err(error)),
+        };
+        let question = q.query.clone();
+        let keywords = if use_chat {
+            tokio::time::timeout(
+                std::time::Duration::from_secs(6),
+                crate::ai::search_keywords(&question),
+            )
+            .await
+            .ok()
+            .and_then(Result::ok)
+            .filter(|text| !text.is_empty())
+        } else {
+            None
+        };
+        let rows = match self
+            .library
+            .run(move |db| {
+                let mut q = q;
+                if let Some(keywords) = keywords {
+                    let expanded = format!("{}\n{}", q.query, keywords);
+                    if expanded.len() <= 8192 {
+                        let original = std::mem::replace(&mut q.query, expanded);
+                        let rows = library::search(db, &q)?;
+                        if !rows.is_empty() {
+                            return Ok(rows);
+                        }
+                        q.query = original;
+                    }
+                }
+                library::search(db, &q)
+            })
+            .await
+        {
+            Ok(result) => result,
+            Err(error) => return reply(Err(error)),
+        };
+        let answer = if use_chat && !rows.is_empty() {
+            match tokio::time::timeout(
+                std::time::Duration::from_secs(12),
+                crate::ai::ask(&question, &rows),
+            )
+            .await
+            {
+                Ok(Ok(answer)) => json!({"answer": answer}),
+                _ => {
+                    json!({"answer_error": "StarStack could not generate a recommendation. Use the repository results."})
+                }
+            }
+        } else {
+            json!({})
+        };
+        let mut result = answer;
+        result["repositories"] = json!(library::cards(rows));
+        reply(Ok(result))
     }
     #[tool(
         description = "Look up a starred repository by owner/name for its metadata, README, private tags, note and link."
@@ -74,12 +135,12 @@ impl Mcp {
         reply(self.library.run(|db| Ok(json!(store::stats(db)?))).await)
     }
     #[tool(
-        description = "Request a sync. Tell the user to confirm in StarStack's Sync settings or locally using the returned command. Only the signed-in user can authorize the GitHub and index update."
+        description = "Request a sync. Tell the user to confirm under StarStack's Sync & index → Schedule & quotas or locally using the returned command. Only the signed-in user can authorize the GitHub and index update."
     )]
     async fn request_sync(&self) -> CallToolResult {
         reply(self.library.run(|db|{
             let id=uuid::Uuid::new_v4().to_string();store::set_meta(db,"pending_sync",&id)?;
-            Ok(json!({"status":"awaiting_user_confirmation","request_id":id,"instructions":"打开星栈后台的同步设置，确认助手的同步请求。","local_command":(store::owner(db)?==store::PRIMARY).then(||format!("starstack sync --approve {id}"))}))
+            Ok(json!({"status":"awaiting_user_confirmation","request_id":id,"instructions":"打开星栈后台的「同步与索引 → 计划与额度」，确认助手的同步请求。","local_command":(store::owner(db)?==store::PRIMARY).then(||format!("starstack sync --approve {id}"))}))
         }).await)
     }
 }

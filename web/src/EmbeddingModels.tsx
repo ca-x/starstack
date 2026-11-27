@@ -1,5 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { EuiButton, EuiFieldText, EuiFormRow, EuiSelect, EuiTextArea } from "@elastic/eui";
+import { EuiButton, EuiButtonGroup, EuiFieldText, EuiFormRow, EuiSelect, EuiTextArea } from "@elastic/eui";
 import { api, message } from "./api";
 import { read, t, write } from "./locale";
 import { ChunkingSettings, type Chunking } from "./ChunkingSettings";
@@ -28,14 +28,15 @@ function approvedUrl(raw: string) {
   } catch { return false; }
 }
 
-export function EmbeddingModels({ admin, jobActive, index, fallbackModel }: {
-  admin: boolean; jobActive: boolean; index: (rebuild: boolean) => Promise<void>; fallbackModel: string;
+export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active, openMarket }: {
+  active: string; openMarket: () => void; admin: boolean; jobActive: boolean; index: (rebuild: boolean) => Promise<void>; fallbackModel: string;
 }) {
   const [catalog, setCatalog] = useState<Catalog>();
   const [draft, setDraft] = useState<string>();
   const [draftUrl, setDraftUrl] = useState<string>();
   const [draftModel, setDraftModel] = useState<string>();
   const [serverList, setServerList] = useState<string>();
+  const [marketView, setMarketView] = useState("discover");
   const [source, setSource] = useState(() => read("starstack.modelSource") === "huggingface" ? "huggingface" : "modelscope");
   const [writing, setWriting] = useState(false);
   const [loadedRevision, setLoadedRevision] = useState(0);
@@ -109,7 +110,14 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel }: {
 
   const feedback = <>{actionError && <Failure error={actionError} />}{notice && <p role="status">{t(notice)}</p>}</>;
 
-  return <section className="operation"><div><h2>{t("语义索引")}</h2>
+  function changeSource(value: string) {
+    setSource(value);
+    write("starstack.modelSource", value);
+  }
+
+  return <>
+    <div className="operations" hidden={active !== "index"} role="tabpanel" id="maintenance-panel-index" aria-labelledby="maintenance-tab-index">
+    <section className="operation"><div><h2>{t("语义索引")}</h2>
     <p>{t("为新增或变更的仓库建立索引。更换模型后可重建全部索引。")}</p></div>
     <dl className="inline-fact"><dt>{t("当前账号模型")}</dt><dd>{catalog
       ? `${catalog.backend === "ollama" ? "Ollama" : t("内置")} · ${catalog.model}` : fallbackModel || t("未配置")}</dd></dl>
@@ -144,20 +152,7 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel }: {
       <EuiButton isDisabled={jobActive || busy || missingActiveFile || catalog?.needs_rebuild} onClick={() => updateIndex(false)}>{t("更新索引")}</EuiButton>
       <EuiButton isDisabled={jobActive || busy || missingActiveFile} onClick={() => updateIndex(true)}>{t("重建索引")}</EuiButton>
     </div>
-    {catalog && <div className="model-files"><h3>{t("内置模型文件")}</h3>
-      <p>{admin || missingActiveFile ? t("模型文件由本实例的账号共用。") : t("模型文件由本实例的账号共用，需要下载时请联系管理员。")}</p>
-      {admin && files.length > 0 && <EuiFormRow className="model-source" label={t("模型下载源")} fullWidth><EuiSelect value={source} fullWidth
-        options={[{ value: "modelscope", text: t("魔搭 ModelScope") }, { value: "huggingface", text: "Hugging Face" }]}
-        onChange={e => { setSource(e.target.value); write("starstack.modelSource", e.target.value); }} /></EuiFormRow>}
-      {files.length ? <ul>{files.map(file => <ModelRow key={file.id} file={file} admin={admin} active={activeFile?.id === file.id}
-        source={source} refreshing={busy} refresh={() => setRevision(n => n + 1)} />)}</ul> : <p>{t("当前构建没有可用的内置模型。")}</p>}
-    </div>}
-    {catalog && <ModelSearch models={files} admin={admin} refresh={() => setRevision(n => n + 1)} />}
-    {admin && catalog && <details className="model-endpoints model-custom"><summary>{t("上传自定义兼容模型")}</summary>
-      <p>{t("选择模型根目录中的三个文件，再单独选择 pooling 配置。服务器会检查模型架构。")}</p>
-      <div className="model-filenames">{customFiles.map(name => <code key={name}>{name}</code>)}</div>
-      <ModelUpload id="custom" label={t("自定义兼容模型")} required={customFiles} disabled={busy} refresh={() => setRevision(n => n + 1)} />
-    </details>}
+    <EuiButton onClick={openMarket}>{t("打开模型市场")}</EuiButton>
     {admin && catalog && <details className="model-endpoints"><summary>{t("管理 Ollama 服务地址")}</summary>
       <form className="model-selector" onSubmit={e => { e.preventDefault(); if (validServers) void change("endpoints", { urls: editedUrls }); }}>
         <EuiFormRow label={t("此实例允许使用的服务地址")} helpText={t("每行一个 HTTP(S) 地址。可填写 1 至 32 个地址，请勿包含凭证、查询参数或片段。")} fullWidth>
@@ -166,5 +161,38 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel }: {
       </form>
     </details>}
     {!chunkFeedback && feedback}
-  </section>;
+    </section></div>
+    <div className="operations market-panel" hidden={active !== "market"} role="tabpanel" id="maintenance-panel-market" aria-labelledby="maintenance-tab-market">
+      <section className="operation">
+        <div className="market-heading"><div><h2>{t("模型市场")}</h2><p>{t("查找、安装和管理本地语义检索模型。模型文件由本实例的账号共用。")}</p></div>
+          <EuiButtonGroup legend={t("模型市场视图")} idSelected={marketView}
+            options={[{ id: "discover", label: t("发现模型") }, { id: "installed", label: t("已安装") }]}
+            onChange={setMarketView} />
+        </div>
+        {readError && <Failure error={readError} retry={() => setRevision(n => n + 1)} />}
+        {!catalog && !readError && <p role="status">{t("正在读取模型状态…")}</p>}
+        {catalog && <>
+          <div className="market-view" hidden={marketView !== "discover"}>
+            <ModelSearch models={files} admin={admin} source={source} changeSource={changeSource} refresh={() => setRevision(n => n + 1)} />
+            <h3>{t("推荐模型")}</h3>
+            <ul className="model-grid">{files.filter(file => !!file.sources?.length).map(file =>
+              <ModelRow key={file.id} file={file} admin={admin} active={activeFile?.id === file.id}
+                source={source} refreshing={busy} refresh={() => setRevision(n => n + 1)} />)}</ul>
+          </div>
+          <div className="market-view" hidden={marketView !== "installed"}>
+            <h3>{t("已安装与下载任务")}</h3>
+            {files.some(file => file.status !== "missing") ? <ul className="model-grid">{files.filter(file => file.status !== "missing").map(file =>
+              <ModelRow key={file.id} file={file} admin={admin} active={activeFile?.id === file.id}
+                source={source} refreshing={busy} refresh={() => setRevision(n => n + 1)} />)}</ul> :
+              <div className="model-empty"><p>{t("还没有本地模型。")}</p><EuiButton onClick={() => setMarketView("discover")}>{t("发现模型")}</EuiButton></div>}
+          </div>
+          {admin && <details className="model-endpoints model-custom"><summary>{t("从本机导入模型")}</summary>
+            <p>{t("选择模型根目录中的三个文件，再单独选择 pooling 配置。服务器会检查模型架构。")}</p>
+            <div className="model-filenames">{customFiles.map(name => <code key={name}>{name}</code>)}</div>
+            <ModelUpload id="custom" label={t("自定义兼容模型")} required={customFiles} disabled={busy} refresh={() => setRevision(n => n + 1)} />
+          </details>}
+        </>}
+      </section>
+    </div>
+  </>;
 }

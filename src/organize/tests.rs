@@ -100,6 +100,7 @@ fn appending_retries_preserves_annotations_and_other_accounts() -> Result<()> {
             tags: Some(vec!["Old".into()]),
             note: Some("personal".into()),
             pinned: Some(true),
+            summary: None,
         },
     )?;
     let batch = || ApplyInput {

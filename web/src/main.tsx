@@ -7,9 +7,10 @@ import { api, counts, message, request, type Stats } from "./api";
 import { Library } from "./Library";
 import { Login } from "./Login";
 import { Mcp } from "./Mcp";
-import { Maintenance, type Job } from "./Maintenance";
+import { Maintenance, type Job, type JobReport } from "./Maintenance";
 import { Statistics } from "./Statistics";
-import { Users, type Profile } from "./Users";
+import { Users } from "./Users";
+import { ProfileButton, type Profile } from "./Profile";
 import { Brand, Failure, Icon } from "./shared";
 
 import libraryIcon from "./icons/stack-library.svg?no-inline";
@@ -37,6 +38,7 @@ function Admin() {
   const [revision, setRevision] = useState(0);
   const [job, setJob] = useState<Job | null>(null);
   const [progress, setProgress] = useState("");
+  const [jobReport, setJobReport] = useState<JobReport>();
   const [jobError, setJobError] = useState("");
   const [externalRunning, setExternalRunning] = useState(false);
   const [loggingOut, setLoggingOut] = useState(false);
@@ -75,15 +77,17 @@ function Admin() {
     const poll = async () => {
       let interval = 4000;
       try {
-        const result = await api<{ message: string | null; running?: boolean }>("progress", undefined, controller.signal);
+        const result = await api<{ message: string | null; running?: boolean; report?: JobReport | null }>("progress", undefined, controller.signal);
         if (controller.signal.aborted) return;
         if (busy.current) {
           if (result.message) setProgress(t(result.message));
+          setJobReport(result.report ?? undefined);
           interval = 900;
         } else if (typeof result.running === "boolean") {
           setExternalRunning(result.running);
+          setJobReport(result.report ?? undefined);
           if (result.running) { setJobError(""); interval = 900; }
-          if (result.message && (result.running || !jobError)) setProgress(t(result.message));
+          if (result.message && (result.running || result.report || !jobError)) setProgress(t(result.message));
           if (previouslyRunning && !result.running) refresh();
           previouslyRunning = result.running;
         }
@@ -97,12 +101,13 @@ function Admin() {
   async function run(next: Job, full: boolean, requestId?: string) {
     if (busy.current) return;
     busy.current = true;
-    setJob(next); setJobError("");
+    setJob(next); setJobError(""); setJobReport(undefined);
     setProgress(t({ sync: "正在同步收藏…", index: "正在更新索引…", readmes: "正在提交 README 补全任务…" }[next]));
     const input = { sync: requestId ? { request_id: requestId } : { full }, index: { rebuild: full }, readmes: {} }[next];
     try {
-      const result = await api<{ message: string }>(next, input);
+      const result = await api<JobReport>(next, input);
       if (next === "readmes") setExternalRunning(true);
+      else setJobReport(result);
       setProgress(t(result.message || (next === "readmes" ? "已提交 README 补全任务。" : "操作已完成。")));
     } catch (e) { setJobError(message(e)); setProgress(""); }
     finally { busy.current = false; setJob(null); refresh(); }
@@ -123,16 +128,16 @@ function Admin() {
     <a className="skip" href="#main" onClick={e => { e.preventDefault(); main.current?.focus(); }}>{t("跳到主要内容")}</a>
     <header className="topbar"><div className="header-brand"><button ref={menuButton} className="mobile-toggle" aria-label={t("切换导航")} aria-expanded={mobileNav}
       aria-controls="navigation" onClick={() => setMobileNav(!mobileNav)}><Icon type={mobileNav ? "cross" : "menu"} /></button><Brand /><span className="brand-divider">{t("收藏管理台")}</span></div>
-      <div className="profile-menu"><PreferenceMenu /><span>{profile.username}</span><EuiButtonEmpty size="s" aria-label={t("退出登录")} title={t("退出登录")} isDisabled={loggingOut} iconType="logOut" onClick={logout}><span className="signout-label">{t("退出登录")}</span></EuiButtonEmpty></div></header>
+      <div className="profile-menu"><PreferenceMenu /><ProfileButton profile={profile} changed={setProfile} /><EuiButtonEmpty size="s" aria-label={t("退出登录")} title={t("退出登录")} isDisabled={loggingOut} iconType="logOut" onClick={logout}><span className="signout-label">{t("退出登录")}</span></EuiButtonEmpty></div></header>
     <aside id="navigation" className={mobileNav ? "rail is-open" : "rail"}><nav aria-label={t("主导航")}>
       <span className="nav-label">{t("工作区")}</span><div className="nav-group">{navigation().map(([href, name, icon]) => navItem(href, name, icon, href === "#library" ? stats.total : undefined))}{profile.admin && navItem("#users", t("用户管理"), usersIcon)}</div>
       {Object.keys(stats.tags).length > 0 && <><span className="nav-label">{t("我的标签")}</span><div className="nav-group">{counts(stats.tags).map(([name, n]) => navItem(tagLink(name), name, tagIcon, n))}</div></>}
     </nav></aside>
-    <main id="main" className="workspace" tabIndex={-1} ref={main}>
+    <main id="main" className={`workspace${["#sync", "#users", "#mcp"].includes(route) ? " workspace--settings" : ""}`} tabIndex={-1} ref={main}>
       {statsError && <Failure error={statsError} retry={refresh} />}{logoutError && <Failure error={logoutError} />}
       {job && route !== "#sync" && <a href="#sync" className="progress-note">{progress || t("查看任务进度")} <Icon type="arrowRight" /></a>}
-      {route === "#sync" ? <Maintenance stats={stats} admin={profile.admin} job={job || (externalRunning ? "sync" : null)} progress={progress} error={jobError} run={run} /> :
-        route === "#users" && profile.admin ? <Users /> : route === "#mcp" ? <Mcp /> : route === "#statistics" ? <Statistics stats={stats} tagLink={tagLink} /> :
+      {route === "#sync" ? <Maintenance stats={stats} admin={profile.admin} job={job || (externalRunning ? "sync" : null)} progress={progress} report={jobReport} error={jobError} run={run} /> :
+        route === "#users" && profile.admin ? <Users username={profile.username} /> : route === "#mcp" ? <Mcp /> : route === "#statistics" ? <Statistics stats={stats} tagLink={tagLink} /> :
         <Library key={route} stats={stats} initial={{ pinned: route === "#pinned" || undefined, tag }} revision={revision} onEdit={refresh} onSync={() => { location.hash = "sync"; }} />}
     </main>
   </div>;

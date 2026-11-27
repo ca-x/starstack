@@ -50,19 +50,32 @@ fn password_hash(password: &str) -> Result<String> {
         .map(|h| h.to_string())
         .map_err(|_| anyhow::anyhow!("计算密码摘要失败"))
 }
+pub(crate) fn needs_setup(db: &mut Db) -> Result<bool> {
+    Ok(accounts::table.count().get_result::<i64>(db)? == 0)
+}
+
+pub(crate) fn setup(db: &mut Db, username: &str, password: &str) -> Result<()> {
+    db.immediate_transaction(|db| {
+        ensure!(needs_setup(db)?, "星栈已初始化，请直接登录");
+        new_account(db, PRIMARY, username, password, true)
+    })
+}
+
 pub(crate) fn bootstrap(db: &mut Db) -> Result<()> {
-    if accounts::table
-        .find(PRIMARY)
-        .count()
-        .get_result::<i64>(db)?
-        > 0
-    {
+    if !needs_setup(db)? {
         return Ok(());
     }
-    let user = env::var("STARSTACK_ADMIN_USER").context("首次启动请设置 STARSTACK_ADMIN_USER")?;
+    let user = env::var("STARSTACK_ADMIN_USER")
+        .ok()
+        .filter(|s| !s.is_empty());
     let pass = env::var("STARSTACK_ADMIN_PASSWORD")
-        .context("首次启动请设置 STARSTACK_ADMIN_PASSWORD（至少 8 字节）")?;
-    new_account(db, PRIMARY, &user, &pass, true)
+        .ok()
+        .filter(|s| !s.is_empty());
+    match (user, pass) {
+        (None, None) => Ok(()),
+        (Some(user), Some(pass)) => setup(db, &user, &pass),
+        _ => bail!("环境初始化需要同时设置 STARSTACK_ADMIN_USER 和 STARSTACK_ADMIN_PASSWORD"),
+    }
 }
 fn new_account(db: &mut Db, id: &str, user: &str, password: &str, admin: bool) -> Result<()> {
     use accounts as a;
@@ -143,6 +156,37 @@ pub(crate) fn update(db: &mut Db, actor: &str, input: Update) -> Result<()> {
         Ok(())
     })
 }
+pub(crate) fn delete(db: &mut Db, actor: &Account, username: &str) -> Result<()> {
+    use accounts as a;
+    db.immediate_transaction(|db| {
+        let current = account(db, &actor.id)?;
+        ensure!(
+            current.admin && !current.disabled && current.revision == actor.revision,
+            "需要有效的管理员会话"
+        );
+        let user = a::table
+            .filter(a::username.eq(username))
+            .select(Account::as_select())
+            .first::<Account>(db)
+            .optional()?
+            .context("用户不存在")?;
+        ensure!(user.id != current.id, "不能删除自己的账号");
+        diesel::delete(access_tokens::table.filter(access_tokens::owner_id.eq(&user.id)))
+            .execute(db)?;
+        use store::metadata_values as m;
+        diesel::delete(
+            m::table.filter(
+                m::owner_id
+                    .eq(&user.id)
+                    .and(m::key.eq_any(["github_token", "github_source"])),
+            ),
+        )
+        .execute(db)?;
+        diesel::delete(a::table.find(user.id)).execute(db)?;
+        Ok(())
+    })
+}
+
 pub(crate) fn verify(db: &mut Db, username: &str, password: &str) -> Result<Account> {
     let (user, hash) = accounts::table
         .filter(
@@ -275,12 +319,37 @@ pub(crate) fn use_gh(db: &mut Db) -> Result<()> {
         store::delete_meta(db, "github_token")
     })
 }
+pub(crate) fn github_source(db: &mut Db) -> Result<Option<&'static str>> {
+    if store::owner(db)? == PRIMARY {
+        if environment_token().is_some() {
+            return Ok(Some("environment"));
+        }
+        if store::meta(db, "github_source")?.as_deref() == Some("gh") {
+            return Ok(Some("gh"));
+        }
+    }
+    Ok(store::meta(db, "github_token")?.map(|_| "device"))
+}
 pub(crate) fn has_github_credentials(db: &mut Db) -> Result<bool> {
-    let primary = store::owner(db)? == PRIMARY;
-    Ok((primary
-        && (environment_token().is_some()
-            || store::meta(db, "github_source")?.as_deref() == Some("gh")))
-        || store::meta(db, "github_token")?.is_some())
+    Ok(github_source(db)?.is_some())
+}
+pub(crate) fn disconnect_github(db: &mut Db) -> Result<()> {
+    db.immediate_transaction(|db| {
+        ensure!(
+            github_source(db)? != Some("environment"),
+            "请从部署环境移除 GitHub 令牌"
+        );
+        for key in ["github_token", "github_source"] {
+            store::delete_meta(db, key)?;
+        }
+        Ok(())
+    })
+}
+pub(crate) fn save_github_token(db: &mut Db, token: &str) -> Result<()> {
+    db.immediate_transaction(|db| {
+        store::set_meta(db, "github_token", token)?;
+        store::delete_meta(db, "github_source")
+    })
 }
 pub(crate) fn github_token(db: &mut Db) -> Result<String> {
     if store::owner(db)? == PRIMARY {
@@ -358,12 +427,19 @@ impl Device {
         })
     }
     pub(crate) fn poll(&mut self, db: &mut Db) -> Result<bool> {
+        let Some(token) = self.poll_token()? else {
+            return Ok(false);
+        };
+        save_github_token(db, &token)?;
+        Ok(true)
+    }
+    pub(crate) fn poll_token(&mut self) -> Result<Option<String>> {
         ensure!(
             Instant::now() < self.expires,
             "设备码已过期，请重新发起授权"
         );
         if Instant::now() < self.next {
-            return Ok(false);
+            return Ok(None);
         }
         #[derive(Deserialize)]
         struct Answer {
@@ -382,17 +458,13 @@ impl Device {
             .send();
         self.next = Instant::now() + Duration::from_secs(self.interval);
         let response = match response {
-            Err(e) if e.is_connect() || e.is_timeout() => return Ok(false),
-            Ok(r) if r.status().is_server_error() => return Ok(false),
+            Err(e) if e.is_connect() || e.is_timeout() => return Ok(None),
+            Ok(r) if r.status().is_server_error() => return Ok(None),
             result => result?,
         };
         let answer = response.error_for_status()?.json::<Answer>()?;
         if let Some(token) = answer.access_token {
-            db.immediate_transaction::<_, anyhow::Error, _>(|db| {
-                store::set_meta(db, "github_token", &token)?;
-                store::delete_meta(db, "github_source")
-            })?;
-            return Ok(true);
+            return Ok(Some(token));
         }
         match answer.error.as_deref() {
             Some("authorization_pending") => {}
@@ -402,7 +474,7 @@ impl Device {
             _ => bail!("GitHub 授权失败，请确认 client ID 后重新发起授权"),
         }
         self.next = Instant::now() + Duration::from_secs(self.interval);
-        Ok(false)
+        Ok(None)
     }
 }
 
@@ -412,6 +484,31 @@ mod tests {
     use crate::test_http::{Reply, Server};
     use serde_json::json;
     use std::sync::atomic::{AtomicUsize, Ordering};
+
+    #[test]
+    fn setup_and_admin_deletion_never_reopen_registration() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = store::connect(dir.path())?;
+        assert!(needs_setup(&mut db)?);
+        setup(&mut db, "owner", "fixture-owner-password")?;
+        assert!(setup(&mut db, "other", "fixture-other-password").is_err());
+        create(
+            &mut db,
+            PRIMARY,
+            Create {
+                username: "other".into(),
+                password: "fixture-other-password".into(),
+                admin: true,
+            },
+        )?;
+        let other = verify(&mut db, "other", "fixture-other-password")?;
+        assert!(delete(&mut db, &other, "other").is_err());
+        delete(&mut db, &other, "owner")?;
+        assert!(!needs_setup(&mut db)?);
+        assert!(verify(&mut db, "owner", "fixture-owner-password").is_err());
+        assert!(verify(&mut db, "other", "fixture-other-password")?.admin);
+        Ok(())
+    }
 
     #[test]
     fn device_flow_handles_polling_and_scopes_the_persisted_token() -> Result<()> {
@@ -459,6 +556,14 @@ mod tests {
         d.next = Instant::now();
         assert!(d.poll(&mut db)?);
         assert_eq!(github_token(&mut db)?, "user-scoped-fixture-token");
+        assert_eq!(github_source(&mut db)?, Some("device"));
+        store::set_meta(&mut db, "github_account", "linked-owner")?;
+        disconnect_github(&mut db)?;
+        assert_eq!(github_source(&mut db)?, None);
+        assert_eq!(
+            store::meta(&mut db, "github_account")?.as_deref(),
+            Some("linked-owner")
+        );
         let mut other = store::connect_as(dir.path(), "second")?;
         assert!(github_token(&mut other).is_err());
         Ok(())

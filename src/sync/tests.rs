@@ -85,15 +85,22 @@ fn synchronization_retries_keeps_cursor_on_failure_and_reconciles_removals() -> 
         store::Edit {
             id: 7,
             note: Some("keep this note".into()),
+            summary: Some("keep this summary".into()),
             ..Default::default()
         },
     )?;
+    store::save_repository_code(&mut db, 7, "keep this snippet")?;
     round.store(1, Ordering::Relaxed);
     assert_eq!(
         synchronize(&mut db, false, Mode::Readmes, &gh, &|_| {})?.skipped,
         2
     );
     assert_eq!(reads.load(Ordering::Relaxed), 3);
+    let repo = store::by_id(&mut db, 7)?;
+    assert_eq!(repo.summary, "keep this summary");
+    assert_eq!(repo.code_context, "keep this snippet");
+    let mut other = store::connect_as(temp.path(), "other")?;
+    assert!(store::save_repository_code(&mut other, 7, "forbidden").is_err());
     let cursor = store::meta(&mut db, "star_cursor")?;
     round.store(2, Ordering::Relaxed);
     let partial = synchronize(&mut db, false, Mode::Readmes, &gh, &|_| {})?;

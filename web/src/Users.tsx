@@ -1,23 +1,23 @@
 import { t } from "./locale";
 import { useEffect, useState, type FormEvent } from "react";
 import {
-  EuiButton, EuiButtonEmpty, EuiCheckbox, EuiFieldPassword, EuiFieldText,
+  EuiButton, EuiButtonEmpty, EuiCheckbox, EuiConfirmModal, EuiFieldPassword, EuiFieldText,
   EuiFlyout, EuiFlyoutBody, EuiFlyoutFooter, EuiFlyoutHeader, EuiFormRow,
 } from "@elastic/eui";
 import { api, message } from "./api";
 import { InstanceProxy } from "./InstanceProxy";
 import { Failure } from "./shared";
 
-export interface Profile { username: string; admin: boolean }
-interface User extends Profile { disabled: boolean; primary: boolean }
+interface User { username: string; admin: boolean; disabled: boolean; primary: boolean }
 
-function UserForm({ user, close, saved }: { user?: User; close: () => void; saved: () => void }) {
+function UserForm({ user, canDelete, close, saved }: { user?: User; canDelete: boolean; close: () => void; saved: (deleted?: boolean) => void }) {
   const [username, setUsername] = useState(user?.username || "");
   const [password, setPassword] = useState("");
   const [admin, setAdmin] = useState(user?.admin || false);
   const [disabled, setDisabled] = useState(user?.disabled || false);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
+  const [confirm, setConfirm] = useState(false);
   const changed = user ? !!password || admin !== user.admin || disabled !== user.disabled : !!username.trim() && !!password;
   async function submit(e: FormEvent) {
     e.preventDefault();
@@ -30,7 +30,15 @@ function UserForm({ user, close, saved }: { user?: User; close: () => void; save
       saved();
     } catch (e) { setError(message(e)); setBusy(false); }
   }
-  return <EuiFlyout onClose={() => { if (!busy) close(); }} size="s" aria-labelledby="user-title" ownFocus>
+  async function remove() {
+    if (busy || !user || !canDelete) return;
+    setBusy(true); setError("");
+    try {
+      await api("users/delete", { username: user.username });
+      saved(true);
+    } catch (e) { setError(message(e)); setConfirm(false); setBusy(false); }
+  }
+  return <><EuiFlyout onClose={() => { if (!busy) close(); }} size="s" aria-labelledby="user-title" ownFocus>
     <EuiFlyoutHeader hasBorder><h2 id="user-title">{user ? t("管理 {0}", user.username) : t("创建用户")}</h2></EuiFlyoutHeader>
     <EuiFlyoutBody><form className="user-form" id="user-form" onSubmit={submit}>
       {!user && <EuiFormRow label={t("用户名")} fullWidth><EuiFieldText fullWidth autoComplete="off" required value={username} onChange={e => setUsername(e.target.value)} /></EuiFormRow>}
@@ -43,12 +51,19 @@ function UserForm({ user, close, saved }: { user?: User; close: () => void; save
       {user && <p className="user-impact">{t("保存变更将清除该用户的登录会话及 MCP 令牌。")}</p>}
       {error && <Failure error={error} />}
     </form></EuiFlyoutBody>
-    <EuiFlyoutFooter><div className="drawer-actions"><EuiButton isDisabled={busy} onClick={close}>{t("取消")}</EuiButton>
+    <EuiFlyoutFooter><div className="drawer-actions">
+      {canDelete && <EuiButtonEmpty color="danger" isDisabled={busy} onClick={() => setConfirm(true)}>{t("删除用户")}</EuiButtonEmpty>}<EuiButton isDisabled={busy} onClick={close}>{t("取消")}</EuiButton>
       <EuiButton type="submit" form="user-form" fill isLoading={busy} isDisabled={!changed}>{user ? t("保存变更") : t("创建")}</EuiButton></div></EuiFlyoutFooter>
-  </EuiFlyout>;
+  </EuiFlyout>
+    {confirm && user && <EuiConfirmModal title={t("删除账号 {0}？", user.username)}
+      onCancel={() => { if (!busy) setConfirm(false); }} onConfirm={remove}
+      cancelButtonText={t("取消")} confirmButtonText={t("删除用户")} buttonColor="danger" isLoading={busy}>
+      <p>{t("账号、登录会话和令牌将失效。收藏和批注仍保留在数据库中，无法通过该账号访问。")}</p>
+    </EuiConfirmModal>}
+  </>;
 }
 
-export function Users() {
+export function Users({ username }: { username: string }) {
   const [users, setUsers] = useState<User[]>([]);
   const [editing, setEditing] = useState<User | "new" | null>(null);
   const [revision, setRevision] = useState(0);
@@ -65,15 +80,15 @@ export function Users() {
   }, [revision]);
   return <>
     <div className="page-heading"><div><h1>{t("用户管理")}</h1><p>{t("创建账号、调整角色及管理访问权限。")}</p></div></div>
-    <section className="collection"><div className="result-head"><h2>{t("用户列表")}</h2><EuiButton size="s" fill onClick={() => setEditing("new")}>{t("创建用户")}</EuiButton></div>
+    <div className="user-settings-grid"><section className="collection"><div className="result-head"><h2>{t("用户列表")}</h2><EuiButton size="s" fill onClick={() => setEditing("new")}>{t("创建用户")}</EuiButton></div>
       {error ? <Failure error={error} retry={() => setRevision(n => n + 1)} /> : !loaded ? <p className="empty" role="status">{t("正在读取用户…")}</p> :
         <ul className="user-list">{users.map(user => <li key={user.username}><div><strong>{user.username}</strong>
           <small>{user.primary ? t("初始管理员") : user.admin ? t("管理员") : t("普通用户")} · {user.disabled ? t("已停用") : t("已启用")}</small></div>
           <EuiButtonEmpty aria-label={t("管理 {0}", user.username)} onClick={() => { setStatus(""); setEditing(user); }}>{t("管理")}</EuiButtonEmpty></li>)}</ul>}</section>
     {status && <p role="status" className="progress-note">{status}</p>}
-    <InstanceProxy />
-    {editing && <UserForm user={editing === "new" ? undefined : editing} close={() => setEditing(null)} saved={() => {
-      setStatus(editing === "new" ? t("用户已创建。") : t("用户已更新。")); setEditing(null); setRevision(n => n + 1);
+    <InstanceProxy /></div>
+    {editing && <UserForm user={editing === "new" ? undefined : editing} canDelete={editing !== "new" && editing.username !== username} close={() => setEditing(null)} saved={deleted => {
+      setStatus(deleted ? t("用户已删除。") : editing === "new" ? t("用户已创建。") : t("用户已更新。")); setEditing(null); setRevision(n => n + 1);
     }} />}
   </>;
 }

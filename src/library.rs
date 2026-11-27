@@ -36,14 +36,22 @@ pub(crate) struct Query {
     /// Maximum number of returned repositories (1 to 100).
     pub limit: Option<usize>,
 }
+impl Query {
+    pub(crate) fn validate(&self) -> Result<()> {
+        ensure!(
+            !self.query.trim().is_empty() && self.query.len() <= 8192,
+            "检索词应为 1 至 8192 字节"
+        );
+        ensure!(
+            (1..=100).contains(&self.limit.unwrap_or(10)),
+            "检索条数应在 1 至 100 之间"
+        );
+        self.filter.validate()
+    }
+}
 pub(crate) fn search(db: &mut Db, q: &Query) -> Result<Vec<Repo>> {
-    ensure!(
-        !q.query.trim().is_empty() && q.query.len() <= 8192,
-        "检索词应为 1 至 8192 字节"
-    );
+    q.validate()?;
     let limit = q.limit.unwrap_or(10);
-    ensure!((1..=100).contains(&limit), "检索条数应在 1 至 100 之间");
-    q.filter.validate()?;
     match index::search(db, &q.query, &q.filter, limit) {
         Err(error) if error.is::<index::Stale>() => {
             index::build(db, false, &|_| {})?;
@@ -132,6 +140,9 @@ pub(crate) fn export(rows: &[Repo], format: Format) -> Result<String> {
         )?;
         if !r.tags.is_empty() {
             writeln!(out, "\n标签　{}", plain(&r.tags.join("、")))?;
+        }
+        if !r.summary.is_empty() {
+            writeln!(out, "\n{}", plain(&r.summary))?;
         }
         if !r.note.is_empty() {
             writeln!(out, "\n> {}", plain(&r.note))?;

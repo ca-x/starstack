@@ -64,7 +64,7 @@ export function ModelRow({ file, admin, active, source, refreshing, refresh }: {
         <div className="model-file-header"><div><strong>{file.label}</strong>
           {file.label !== file.id && <small>{file.id}</small>}
           {file.status !== "downloading" && file.total_bytes != null && file.total_bytes > 0 && <small>{t("模型大小 {0}", size(file.total_bytes))}</small>}</div>
-          <span className="model-state">{t(statuses[file.status])}</span></div>
+          <span className="model-state" data-status={file.status}>{t(active && file.status === "ready" ? "当前检索模型" : statuses[file.status])}</span></div>
         {file.status === "downloading" && <DownloadProgress model={file} />}
         {file.status === "failed" && file.error && <p className="model-error">{t(file.error)}</p>}
         {admin && file.status !== "downloading" && <div className="row-controls">

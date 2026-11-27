@@ -14,7 +14,7 @@ pub(crate) type Db = SqliteConnection;
 pub(crate) const PRIMARY: &str = "primary";
 
 diesel::table! { repositories (owner_id, id) {
-    owner_id -> Text, id -> BigInt, metadata -> Text, tags -> Text, note -> Text, pinned -> Bool, active -> Bool,
+    owner_id -> Text, id -> BigInt, metadata -> Text, tags -> Text, note -> Text, pinned -> Bool, active -> Bool, summary -> Text, code_context -> Text, commit_index -> Text,
 }}
 diesel::table! { metadata_values (owner_id, key) {owner_id -> Text, key -> Text, value -> Text,}}
 diesel::table! { current_library (owner_id) { owner_id -> Text, directory -> Text, }}
@@ -66,14 +66,22 @@ pub(crate) fn connect_as(dir: &Path, user: &str) -> Result<Db> {
         .get_result::<SchemaVersion>(&mut conn)?
         .user_version;
     ensure!(
-        (0..=2).contains(&version),
+        (0..=3).contains(&version),
         "数据库版本 {version} 高于此程序支持的版本，请使用较新的星栈"
     );
-    if version < 2 {
-        conn.immediate_transaction::<_,diesel::result::Error,_>(|db|{
-            if version==0 {db.batch_execute(include_str!("schema.sql"))?;}
-            db.batch_execute(include_str!("lists_schema.sql"))?;
-            db.batch_execute("CREATE TABLE IF NOT EXISTS github_windows(scope TEXT NOT NULL,resource TEXT NOT NULL,observations TEXT NOT NULL,PRIMARY KEY(scope,resource)); PRAGMA user_version=2")
+    if version < 3 {
+        conn.immediate_transaction::<_, diesel::result::Error, _>(|db| {
+            let version = diesel::sql_query("PRAGMA user_version").get_result::<SchemaVersion>(db)?.user_version;
+            if version == 0 { db.batch_execute(include_str!("schema.sql"))?; }
+            if version < 2 {
+                db.batch_execute(include_str!("lists_schema.sql"))?;
+                db.batch_execute("CREATE TABLE IF NOT EXISTS github_windows(scope TEXT NOT NULL,resource TEXT NOT NULL,observations TEXT NOT NULL,PRIMARY KEY(scope,resource))")?;
+            }
+            if version < 3 {
+                db.batch_execute(include_str!("commits_schema.sql"))?;
+                db.batch_execute("ALTER TABLE repositories ADD COLUMN summary TEXT NOT NULL DEFAULT ''; ALTER TABLE repositories ADD COLUMN code_context TEXT NOT NULL DEFAULT ''; ALTER TABLE repositories ADD COLUMN commit_index TEXT NOT NULL DEFAULT ''; PRAGMA user_version=3")?;
+            }
+            Ok(())
         })?;
     }
     conn.batch_execute(
@@ -124,6 +132,12 @@ pub(crate) struct Repo {
     pub tags: Vec<String>,
     #[serde(default)]
     pub note: String,
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub summary: String,
+    #[serde(skip)]
+    pub code_context: String,
+    #[serde(skip)]
+    pub commit_index: String,
     #[serde(default)]
     pub pinned: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -178,7 +192,7 @@ pub(crate) fn upsert(db: &mut Db, r: &Repo) -> Result<Change> {
     let owner = owner(db)?;
     let mut val = serde_json::to_value(r)?;
     if let Some(o) = val.as_object_mut() {
-        for key in ["tags", "note", "pinned", "score"] {
+        for key in ["tags", "note", "pinned", "score", "summary"] {
             o.remove(key);
         }
     }
@@ -206,12 +220,17 @@ pub(crate) fn upsert(db: &mut Db, r: &Repo) -> Result<Change> {
         }
     }
 }
-type Snapshot = (String, String, String, bool);
-fn decode((raw, tags, note, pinned): Snapshot) -> Result<Repo> {
+type Snapshot = (String, String, String, bool, String, String, String);
+fn decode(
+    (raw, tags, note, pinned, summary, code_context, commit_index): Snapshot,
+) -> Result<Repo> {
     let mut r: Repo = serde_json::from_str(&raw).context("仓库数据损坏，请运行 sync --full")?;
     r.tags = serde_json::from_str(&tags)?;
     r.note = note;
     r.pinned = pinned;
+    r.summary = summary;
+    r.code_context = code_context;
+    r.commit_index = commit_index;
     Ok(r)
 }
 #[cfg(test)]
@@ -229,7 +248,15 @@ pub(crate) fn visit_repos(db: &mut Db, mut visit: impl FnMut(Repo) -> Result<()>
     let owner = owner(db)?;
     let rows = t::table
         .filter(t::owner_id.eq(owner).and(t::active.eq(true)))
-        .select((t::metadata, t::tags, t::note, t::pinned))
+        .select((
+            t::metadata,
+            t::tags,
+            t::note,
+            t::pinned,
+            t::summary,
+            t::code_context,
+            t::commit_index,
+        ))
         .load_iter::<Snapshot, _>(db)?;
     for row in rows {
         visit(decode(row?)?)?;
@@ -243,7 +270,15 @@ pub(crate) fn by_id(db: &mut Db, id: i64) -> Result<Repo> {
         t::table
             .find((owner, id))
             .filter(t::active.eq(true))
-            .select((t::metadata, t::tags, t::note, t::pinned))
+            .select((
+                t::metadata,
+                t::tags,
+                t::note,
+                t::pinned,
+                t::summary,
+                t::code_context,
+                t::commit_index,
+            ))
             .first::<Snapshot>(db)
             .optional()?
             .context("当前收藏中没有这个仓库")?,
@@ -264,7 +299,15 @@ pub(crate) fn by_name(db: &mut Db, name: &str) -> Result<Repo> {
                     .and(t::active.eq(true))
                     .and(name_filter),
             )
-            .select((t::metadata, t::tags, t::note, t::pinned))
+            .select((
+                t::metadata,
+                t::tags,
+                t::note,
+                t::pinned,
+                t::summary,
+                t::code_context,
+                t::commit_index,
+            ))
             .first(db)
             .optional()?
             .context("未找到该仓库，请使用 list 查看 owner/repo 全名")?,
@@ -295,6 +338,7 @@ pub(crate) struct Edit {
     pub id: i64,
     pub tags: Option<Vec<String>>,
     pub note: Option<String>,
+    pub summary: Option<String>,
     pub pinned: Option<bool>,
 }
 pub(crate) fn edit(db: &mut Db, patch: Edit) -> Result<Repo> {
@@ -314,6 +358,10 @@ pub(crate) fn edit_in_transaction(db: &mut Db, patch: Edit) -> Result<Repo> {
     if let Some(note) = patch.note {
         r.note = note;
     }
+    if let Some(summary) = patch.summary {
+        ensure!(summary.len() <= 16 * 1024, "仓库总结或代码片段超过长度限制");
+        r.summary = summary.trim().to_owned();
+    }
     if let Some(pin) = patch.pinned {
         r.pinned = pin;
     }
@@ -326,11 +374,33 @@ pub(crate) fn edit_in_transaction(db: &mut Db, patch: Edit) -> Result<Repo> {
         .set((
             t::tags.eq(serde_json::to_string(&r.tags)?),
             t::note.eq(&r.note),
+            t::summary.eq(&r.summary),
             t::pinned.eq(r.pinned),
         ))
         .execute(db)?;
     bump_revision(db)?;
     Ok(r)
+}
+pub(crate) fn save_repository_code(db: &mut Db, id: i64, content: &str) -> Result<()> {
+    use repositories as r;
+    ensure!(content.len() <= 48 * 1024, "仓库总结或代码片段超过长度限制");
+    db.immediate_transaction(|db| {
+        let owner = owner(db)?;
+        let changed = diesel::update(
+            r::table
+                .find((owner, id))
+                .filter(r::active.eq(true))
+                .filter(r::code_context.ne(content)),
+        )
+        .set(r::code_context.eq(content))
+        .execute(db)?;
+        if changed > 0 {
+            bump_revision(db)?;
+        } else {
+            by_id(db, id)?;
+        }
+        Ok(())
+    })
 }
 pub(crate) fn meta(db: &mut Db, key: &str) -> Result<Option<String>> {
     let user = owner(db)?;
@@ -454,7 +524,15 @@ pub(crate) fn list(db: &mut Db, filter: &Filter, sort: Sort) -> Result<Vec<Repo>
     use repositories as r;
     filter.validate()?;
     ordered(owner(db)?, filter, sort)
-        .select((r::metadata, r::tags, r::note, r::pinned))
+        .select((
+            r::metadata,
+            r::tags,
+            r::note,
+            r::pinned,
+            r::summary,
+            r::code_context,
+            r::commit_index,
+        ))
         .load::<Snapshot>(db)?
         .into_iter()
         .map(decode)
@@ -475,7 +553,15 @@ pub(crate) fn page(
         let compact =
             diesel::dsl::sql::<diesel::sql_types::Text>("json_remove(metadata,'$.readme')");
         let rows = ordered(user, filter, sort)
-            .select((compact, r::tags, r::note, r::pinned))
+            .select((
+                compact,
+                r::tags,
+                r::note,
+                r::pinned,
+                r::summary,
+                diesel::dsl::sql::<diesel::sql_types::Text>("''"),
+                diesel::dsl::sql::<diesel::sql_types::Text>("''"),
+            ))
             .limit(i64::try_from(limit)?)
             .offset(i64::try_from(offset)?)
             .load::<Snapshot>(db)?

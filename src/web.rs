@@ -18,7 +18,7 @@ use include_dir::{Dir, include_dir};
 use rmcp::transport::streamable_http_server::{
     StreamableHttpServerConfig, StreamableHttpService, session::local::LocalSessionManager,
 };
-use serde::Deserialize;
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use std::{
     collections::HashMap,
@@ -34,18 +34,49 @@ struct Session {
     revision: i32,
     expires: Instant,
 }
+#[derive(Default, Clone, Serialize)]
+struct JobReport {
+    message: String,
+    warnings: Vec<String>,
+    details: Vec<String>,
+}
+impl JobReport {
+    fn from_sync(summary: &crate::sync::Summary, catalog: bool) -> Self {
+        let (message, warnings, details) = summary.web_report(catalog);
+        Self {
+            message,
+            warnings,
+            details,
+        }
+    }
+    fn add_step(&mut self, result: Result<String>, label: &str) {
+        match result {
+            Ok(summary) => self.details.push(summary),
+            Err(error) => {
+                self.warnings.push(format!("{label}：{error}"));
+                self.details
+                    .extend(error.chain().skip(1).map(ToString::to_string));
+            }
+        }
+    }
+}
 #[derive(Default)]
 struct Job {
     message: String,
     running: bool,
+    report: Option<JobReport>,
 }
 struct App {
     base: Library,
     sessions: Mutex<HashMap<String, Session>>,
     jobs: Mutex<HashMap<String, Job>>,
     model_download: Mutex<HashMap<String, Job>>,
-    devices: Mutex<HashMap<(String, String), auth::Device>>,
+    devices: Mutex<HashMap<String, PendingDevice>>,
     logins: Mutex<HashMap<String, (u32, Instant)>>,
+}
+struct PendingDevice {
+    code: String,
+    device: Option<auth::Device>,
 }
 type Shared = Arc<App>;
 struct ApiError(StatusCode, String);
@@ -87,7 +118,20 @@ async fn actor(app: &App, h: &HeaderMap) -> Api<auth::Account> {
             .ok_or_else(unauthorized)?;
         (s.user.clone(), s.revision)
     };
-    let a = app.base.run(move |db| auth::account(db, &id)).await?;
+    let a = app
+        .base
+        .run(move |db| auth::account(db, &id))
+        .await
+        .map_err(|e| {
+            if matches!(
+                e.downcast_ref::<diesel::result::Error>(),
+                Some(diesel::result::Error::NotFound)
+            ) {
+                unauthorized()
+            } else {
+                e.into()
+            }
+        })?;
     if a.disabled || a.revision != rev {
         return Err(unauthorized());
     }
@@ -97,6 +141,23 @@ async fn actor(app: &App, h: &HeaderMap) -> Api<auth::Account> {
 struct Login {
     username: String,
     password: String,
+}
+async fn setup_status(State(app): State<Shared>, h: HeaderMap) -> Api<Json<Value>> {
+    check_header(&h)?;
+    Ok(Json(
+        json!({"required": app.base.run(auth::needs_setup).await?}),
+    ))
+}
+async fn setup(
+    State(app): State<Shared>,
+    h: HeaderMap,
+    Json(req): Json<Login>,
+) -> Api<Json<Value>> {
+    check_header(&h)?;
+    app.base
+        .run(move |db| auth::setup(db, &req.username, &req.password))
+        .await?;
+    Ok(Json(json!({"message": "管理员已创建"})))
 }
 async fn login(
     State(app): State<Shared>,
@@ -350,7 +411,12 @@ async fn read(
     let a = actor(&app, &h).await?;
     let lib = tenant(&app, &a.id);
     let v = match path.as_str() {
-        "me" => json!(a),
+        "me" => lib.run(move|db| Ok(json!({
+            "username":a.username,"admin":a.admin,"disabled":a.disabled,
+            "nickname":store::meta(db,"nickname")?
+        }))).await?,
+        "mcp/settings" => lib.run(|db| Ok(json!({"use_chat":crate::mcp::chat_enabled(db)?}))).await?,
+        "github" => lib.run(|db| Ok(json!({"source": auth::github_source(db)?}))).await?,
         "chat" => lib.run(move|db|crate::chat_settings::status(db,a.admin)).await?,
         "stats" => lib.run(|db| Ok(json!(store::stats(db)?))).await?,
         "tokens" => lib.run(|db| Ok(json!({"tokens": auth::tokens(db)?}))).await?,
@@ -362,7 +428,7 @@ async fn read(
         }).await?,
         "users" => return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
         "proxy" if a.admin=>lib.run(crate::proxy::read_settings).await?,
-        "proxy"=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
+        "proxy" | "proxy/test"=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
         "organize/job" => lib.run(crate::organizer::progress).await?,
         "models" => {
             let mut panel = lib.run(crate::model_preferences::panel).await?;
@@ -386,7 +452,7 @@ async fn read(
         "progress" => {
             let jobs = app.jobs.lock().expect("jobs lock poisoned");
             let job = jobs.get(&a.id);
-            json!({"message":job.map_or("", |j| j.message.as_str()), "running":job.is_some_and(|j|j.running)})
+            json!({"message":job.map_or("", |j| j.message.as_str()), "running":job.is_some_and(|j|j.running), "report":job.and_then(|j|j.report.as_ref())})
         }
         _ => return Err(ApiError(StatusCode::NOT_FOUND,"没有此接口".into())),
     };
@@ -414,18 +480,19 @@ fn start_job(
     lib: Library,
     operation: &str,
     input: Run,
-) -> Result<tokio::task::JoinHandle<Result<String>>> {
+) -> Result<tokio::task::JoinHandle<Result<JobReport>>> {
     {
         let mut jobs = app.jobs.lock().expect("jobs lock poisoned");
         let item = jobs.entry(lib.user.clone()).or_default();
         ensure!(!item.running, "同步或索引正在运行，请查看进度");
         item.running = true;
         item.message = "准备中".into();
+        item.report = None;
     }
     let op = operation.to_owned();
     Ok(tokio::spawn(async move { work(app, lib, op, input).await }))
 }
-async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Result<String> {
+async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Result<JobReport> {
     let catalog = operation == "sync";
     let state = app.clone();
     let user = lib.user.clone();
@@ -444,23 +511,28 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
                     .message = msg.into();
             };
             match operation.as_str() {
-                "index" => index::build(db, input.rebuild, &progress),
+                "index" => Ok(JobReport {
+                    message: index::build(db, input.rebuild, &progress)?,
+                    ..JobReport::default()
+                }),
                 "readme" => {
                     store::set_meta(
                         db,
                         "last_readme_attempt",
                         &chrono::Utc::now().timestamp().to_string(),
                     )?;
-                    let report = crate::sync::enrich(db, &progress)?;
-                    let index = index::build(db, false, &progress)
-                        .unwrap_or_else(|e| format!("索引待更新：{e:#}"));
-                    Ok(format!("{report}。{index}"))
+                    let mut report =
+                        JobReport::from_sync(&crate::sync::enrich(db, &progress)?, false);
+                    report.add_step(index::build(db, false, &progress), "索引待更新");
+                    Ok(report)
                 }
                 _ => {
-                    let catalog = crate::sync::catalog(db, input.full, &progress)?;
-                    let lists = crate::lists::refresh(db, &progress)
-                        .unwrap_or_else(|e| format!("分类未刷新：{e:#}"));
-                    Ok(format!("{catalog}。{lists}"))
+                    let mut report = JobReport::from_sync(
+                        &crate::sync::catalog(db, input.full, &progress)?,
+                        true,
+                    );
+                    report.add_step(crate::lists::refresh(db, &progress), "分类待刷新");
+                    Ok(report)
                 }
             }
         })
@@ -469,10 +541,16 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
         let mut jobs = app.jobs.lock().expect("jobs lock poisoned");
         let item = jobs.entry(lib.user.clone()).or_default();
         item.running = false;
-        item.message = match &result {
-            Ok(s) => s.clone(),
-            Err(e) => format!("{e:#}"),
+        let report = match &result {
+            Ok(report) => report.clone(),
+            Err(error) => JobReport {
+                message: "任务未完成".into(),
+                warnings: vec![error.to_string()],
+                details: error.chain().skip(1).map(ToString::to_string).collect(),
+            },
         };
+        item.message.clone_from(&report.message);
+        item.report = Some(report);
     }
     if catalog && result.is_ok() {
         let enrich = lib
@@ -522,17 +600,76 @@ async fn write(
             let patch = value(body)?;
             lib.run(move|db| Ok(json!(store::edit(db,patch)?))).await?
         }
+        "repository/commits" => {
+            #[derive(Deserialize)]
+            struct CommitInput { id: i64, #[serde(default)] offset: u32, enabled: Option<bool>, limit: Option<usize>, #[serde(default)] refresh: bool }
+            let input:CommitInput=value(body)?;
+            lib.run(move|db|{
+                if let Some(enabled)=input.enabled {
+                    crate::repo_commits::configure(db,input.id,enabled,input.limit.unwrap_or(20))?;
+                }
+                if input.refresh { crate::repo_commits::refresh(db,input.id)?; }
+                crate::repo_commits::status(db,input.id,input.offset)
+            }).await?
+        }
+        "repository/summary" => {
+            #[derive(Deserialize)]
+            struct SummaryInput { id: i64, language: Option<String> }
+            let input:SummaryInput=value(body)?;
+            let repo=lib.run(move|db|store::by_id(db,input.id)).await?;
+            let language=if input.language.as_deref()==Some("en") {"English"} else {"Chinese"};
+            let chat=ai::RepositoryChat::configured().await?;
+            json!({"summary":chat.summarize(&repo,language).await?})
+        }
+        "repository/context" => {
+            #[derive(Deserialize)]
+            struct ContextInput { id: i64, code: String }
+            let input:ContextInput=value(body)?;
+            lib.run(move|db|store::save_repository_code(db,input.id,&input.code)).await?;
+            json!({"message":"已保存到本地"})
+        }
+        "repository/ask" => {
+            #[derive(Deserialize)]
+            struct RepositoryQuestion { id: i64, question: String, #[serde(default)] history: Vec<ai::RepositoryTurn> }
+            let input:RepositoryQuestion=value(body)?;
+            let question=input.question.trim();
+            if question.is_empty() || question.len()>4096 || input.history.len()>4 ||
+                input.history.iter().any(|turn|turn.question.len()>4096 || turn.answer.len()>16*1024) {
+                return Err(ApiError(StatusCode::BAD_REQUEST,"请缩短问题或重新开始仓库对话".into()));
+            }
+            let chat=ai::RepositoryChat::configured().await?;
+            let mut terms=question.to_owned();
+            if let Some(previous)=input.history.last() {
+                terms.push(' ');
+                terms.push_str(&previous.question);
+                terms.push(' ');
+                terms.extend(previous.answer.chars().take(512));
+            }
+            let (repo,code)=lib.run(move|db|{
+                let repo=store::by_id(db,input.id)?;
+                let code=crate::repo_code::collect(db,&repo,&terms)?;
+                Ok((repo,code))
+            }).await?;
+            let answer=chat.question(&repo,question,&input.history,&code).await?;
+            json!({"answer":answer,"source_paths":code.sources.iter().map(|file|&file.path).collect::<Vec<_>>(),
+                "code":code.index_text(),"truncated":code.truncated})
+        }
         "export" => {
             let q: Export = value(body)?;
             let text = lib.run(move|db| library::export(&store::list(db,&q.filter,Sort::Time)?,q.format)).await?;
             let mime = match q.format { Format::Json=>"application/json", Format::Markdown=>"text/markdown; charset=utf-8" };
             return Ok(([(header::CONTENT_TYPE,mime)],text).into_response());
         }
-        "chat" if !a.admin=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
+        "chat" | "chat/models" if !a.admin=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
         "chat" => {
             let input=value(body)?;
             lib.run(move|db|db.immediate_transaction(|db|{verify_admin(db,&a)?;crate::chat_settings::update(db,input)})).await?;
             json!({"message":"AI 聊天服务设置已保存"})
+        }
+        "chat/models" => {
+            let input=value(body)?;
+            let cfg=lib.run(move|db|{verify_admin(db,&a)?;crate::chat_settings::draft(db,input)}).await?;
+            json!({"models":crate::chat_settings::models(cfg).await?})
         }
         "models/search" => {let input=value(body)?;lib.run(move|db|crate::model_hub::search(db,input)).await?}
         "organize/preview" => crate::organizer::preview(lib,body).await?,
@@ -612,11 +749,18 @@ async fn write(
         "sync" | "index" => {
             let input = value(body)?;
             let task = start_job(app,lib,&path,input)?;
-            let message = task.await.context("任务中断")??;
-            json!({"message":message})
+            let result = task.await.context("任务中断")?;
+            match result {
+                Ok(report) => json!(report),
+                Err(error) => return Err(ApiError(StatusCode::BAD_REQUEST, error.to_string())),
+            }
+        }
+        "proxy/test" if a.admin=> {
+            let candidate=body.get("candidate").cloned().unwrap_or(Value::Null);
+            lib.run(move|db|crate::proxy::test_connection(db,candidate,a.revision)).await?
         }
         "proxy" if a.admin=>lib.run(move|db|crate::proxy::save_settings(db,body,a.revision)).await?,
-        "proxy"=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
+        "proxy" | "proxy/test"=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
         "settings"=>{
             let q:Settings=value(body)?;
             lib.run(move|db|db.immediate_transaction(|db|{
@@ -631,6 +775,23 @@ async fn write(
                 settings(db)
             })).await?
         }
+        "me" => {
+            let nickname=string(&body,"nickname")?.trim().to_owned();
+            lib.run(move|db| {
+                ensure!(nickname.chars().count()<=48 && !nickname.chars().any(char::is_control),"昵称最多 48 个字符，不能包含控制字符");
+                if nickname.is_empty() { store::delete_meta(db,"nickname")?; }
+                else { store::set_meta(db,"nickname",&nickname)?; }
+                Ok(json!({"username":a.username,"admin":a.admin,"disabled":a.disabled,
+                    "nickname":(!nickname.is_empty()).then_some(nickname)}))
+            }).await?
+        }
+        "mcp/settings" => {
+            #[derive(Deserialize)]
+            struct McpSettings { use_chat: bool }
+            let input:McpSettings=value(body)?;
+            lib.run(move|db|store::set_meta(db,crate::mcp::USE_CHAT,if input.use_chat {"1"}else{"0"})).await?;
+            json!({"use_chat":input.use_chat})
+        }
         "tokens" => {
             let name=string(&body,"name")?;
             let token=lib.run(move|db| auth::issue(db,&name,a.revision)).await?;
@@ -641,7 +802,7 @@ async fn write(
             lib.run(move|db|auth::revoke(db,&id)).await?;
             json!({"message":"已撤销"})
         }
-        "users" | "users/update" if !a.admin => return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
+        "users" | "users/update" | "users/delete" if !a.admin => return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
         "users" => {
             let q=value(body)?;
             lib.run(move|db|auth::create(db,&a.id,q)).await?;
@@ -652,24 +813,61 @@ async fn write(
             lib.run(move|db|auth::update(db,&a.id,q)).await?;
             json!({"message":"用户已更新"})
         }
+        "users/delete" => {
+            let username=string(&body,"username")?;
+            lib.run(move|db|auth::delete(db,&a,&username)).await?;
+            json!({"message":"用户已删除"})
+        }
+        "github/disconnect" => lib.run(move|db| {
+            let mut devices=app.devices.lock().expect("device lock poisoned");
+            auth::disconnect_github(db)?;
+            devices.remove(&a.id);
+            Ok(json!({"source":null}))
+        }).await?,
         "device/start" => lib.run(move|db| {
+            ensure!(auth::github_source(db)? != Some("environment"), "请从部署环境移除 GitHub 令牌");
             let d=auth::Device::start(db)?;
             let code=auth::secret();
             let result=json!({"code":code,"user_code":d.user_code,"verification_uri":d.verification_uri,"interval":d.interval,"expires_in":d.expires_in});
             let mut devices=app.devices.lock().expect("device lock poisoned");
-            devices.retain(|(u,_),d|*u!=a.id && !d.expired());
-            devices.insert((a.id,code),d);
+            devices.retain(|_,pending|pending.device.as_ref().is_none_or(|d|!d.expired()));
+            devices.insert(a.id,PendingDevice { code, device:Some(d) });
             Ok(result)
         }).await?,
+        "device/cancel" => {
+            let code=string(&body,"code")?;
+            let mut devices=app.devices.lock().expect("device lock poisoned");
+            if devices.get(&a.id).is_some_and(|pending|pending.code==code) {
+                devices.remove(&a.id);
+            }
+            json!({})
+        }
         "device/poll" => {
             let code=string(&body,"code")?;
             lib.run(move|db|{
-                let key=(a.id,code);
-                let mut d=app.devices.lock().expect("device lock poisoned").remove(&key).context("设备授权无效，请重新开始")?;
-                let done=d.poll(db)?;
+                let mut d=app.devices.lock().expect("device lock poisoned")
+                    .get_mut(&a.id).filter(|pending|pending.code==code)
+                    .and_then(|pending|pending.device.take()).context("设备授权无效，请重新开始")?;
+                let token=d.poll_token();
+                let mut devices=app.devices.lock().expect("device lock poisoned");
+                let pending=devices.get_mut(&a.id).filter(|pending|pending.code==code).context("设备授权无效，请重新开始")?;
                 let interval=d.interval;
-                if !done {app.devices.lock().expect("device lock poisoned").insert(key,d);}
-                Ok(json!({"status":if done{"complete"}else{"pending"},"interval":interval}))
+                match token {
+                    Ok(None) => {
+                        pending.device=Some(d);
+                        Ok(json!({"status":"pending","interval":interval}))
+                    }
+                    result => {
+                        devices.remove(&a.id);
+                        let token=result?.context("设备授权无效，请重新开始")?;
+                        db.immediate_transaction(|db| {
+                            let current=auth::account(db,&a.id)?;
+                            ensure!(!current.disabled && current.revision==a.revision, "设备授权无效，请重新开始");
+                            auth::save_github_token(db,&token)
+                        })?;
+                        Ok(json!({"status":"complete","interval":interval}))
+                    }
+                }
             }).await?
         }
         _ => return Err(ApiError(StatusCode::NOT_FOUND,"没有此接口".into())),
@@ -839,6 +1037,7 @@ pub(crate) async fn serve(base: Library, bind: SocketAddr) -> Result<()> {
             post(upload).layer(axum::extract::DefaultBodyLimit::max(1_610_612_736)),
         )
         .route("/api/login", post(login))
+        .route("/api/setup", get(setup_status).post(setup))
         .route("/api/logout", post(logout))
         .route("/api/{*path}", get(read).post(write))
         .route("/mcp", any(mcp_http))

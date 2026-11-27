@@ -17,6 +17,8 @@ mod organize;
 mod organizer;
 mod proxy;
 mod quota;
+mod repo_code;
+mod repo_commits;
 mod store;
 mod sync;
 #[cfg(test)]
