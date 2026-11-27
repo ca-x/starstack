@@ -8,7 +8,7 @@
 
 ## 从零到第一次检索
 
-1. **构建或取得二进制。** 从源码构建需要 Rust 1.97.1 或更新版本和 Node.js 24。以下命令在仓库根目录运行，生成的 `target/release/starstack` 已内置 Web 界面。后文用 `starstack` 指代这个文件，可将它放入 PATH。用 Docker 运行见[部署说明](docs/deploy.md)。
+1. **构建或取得二进制。** 从源码构建需要 Rust 1.97.1 或更新版本、Node.js 24、CMake 和本机 C/C++ 工具链。以下命令在仓库根目录运行，生成的 `target/release/starstack` 已内置 Web 界面。后文用 `starstack` 指代这个文件，可将它放入 PATH。用 Docker 运行见[部署说明](docs/deploy.md)。
 
    ```bash
    (cd web && npm ci && npm run build)

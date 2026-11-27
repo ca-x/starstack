@@ -8,7 +8,7 @@ Ask “What was that Rust parser I starred last year?” StarStack searches your
 
 ## First search
 
-1. Build the executable with Rust 1.97.1 or newer and Node.js 24. Run these commands from the repository root. The result is `target/release/starstack`, with the dashboard embedded. Put it on PATH to use the commands below.
+1. Build the executable with Rust 1.97.1 or newer, Node.js 24, CMake and a native C/C++ toolchain. Run these commands from the repository root. The result is `target/release/starstack`, with the dashboard embedded. Put it on PATH to use the commands below.
 
    ```bash
    (cd web && npm ci && npm run build)

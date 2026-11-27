@@ -188,17 +188,7 @@ impl Location {
             } else {
                 vec![]
             },
-            files: pkg
-                .files
-                .iter()
-                .map(|f| {
-                    if pkg.id == QWEN_ID && f.name == "model.gguf" {
-                        registry::QWEN_FILENAME.to_owned()
-                    } else {
-                        f.name.clone()
-                    }
-                })
-                .collect(),
+            files: pkg.files.iter().map(|f| f.name.clone()).collect(),
             source: (!last.source.is_empty()).then_some(last.source),
             error: last.error,
         })

@@ -310,7 +310,11 @@ body .workspace[tabindex="-1"]:focus { outline: none !important; }
 
 @media (max-width:360px) {
   .profile-menu { gap: 2px; }
-  .profile-menu .signout-label { display: none; }
+  .topbar { padding-inline: 8px; gap: 4px; }
+  .header-brand { gap: 3px; }
+  .header-brand .brand { gap: 5px; font-size: 20px; }
+  .header-brand .brand-image { width: 32px; height: 32px; }
+  .profile-menu .euiButtonEmpty__text { display: none; }
   .profile-menu .euiButtonEmpty { flex: none; min-width: 44px; min-height: 44px; }
 }
 .chat-settings { width: 100%; }
