@@ -14,7 +14,7 @@ use super::{Artifact, Location, bytes, directory};
 use crate::store::Db;
 
 pub(super) fn client(db: &mut Db) -> Result<Client> {
-    Ok(crate::proxy::builder(db)?
+    Ok(crate::proxy::instance_builder(db)?
         .user_agent("StarStack embedding model downloader")
         .no_gzip()
         .connect_timeout(Duration::from_secs(20))

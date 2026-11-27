@@ -5,7 +5,6 @@ import {
   EuiFlyout, EuiFlyoutBody, EuiFlyoutFooter, EuiFlyoutHeader, EuiFormRow,
 } from "@elastic/eui";
 import { api, message } from "./api";
-import { InstanceProxy } from "./InstanceProxy";
 import { Failure } from "./shared";
 
 interface User { username: string; admin: boolean; disabled: boolean; primary: boolean }
@@ -80,13 +79,12 @@ export function Users({ username }: { username: string }) {
   }, [revision]);
   return <>
     <div className="page-heading"><div><h1>{t("用户管理")}</h1><p>{t("创建账号、调整角色及管理访问权限。")}</p></div></div>
-    <div className="user-settings-grid"><section className="collection"><div className="result-head"><h2>{t("用户列表")}</h2><EuiButton size="s" fill onClick={() => setEditing("new")}>{t("创建用户")}</EuiButton></div>
+    <section className="collection"><div className="result-head"><h2>{t("用户列表")}</h2><EuiButton size="s" fill onClick={() => setEditing("new")}>{t("创建用户")}</EuiButton></div>
       {error ? <Failure error={error} retry={() => setRevision(n => n + 1)} /> : !loaded ? <p className="empty" role="status">{t("正在读取用户…")}</p> :
         <ul className="user-list">{users.map(user => <li key={user.username}><div><strong>{user.username}</strong>
           <small>{user.primary ? t("初始管理员") : user.admin ? t("管理员") : t("普通用户")} · {user.disabled ? t("已停用") : t("已启用")}</small></div>
           <EuiButtonEmpty aria-label={t("管理 {0}", user.username)} onClick={() => { setStatus(""); setEditing(user); }}>{t("管理")}</EuiButtonEmpty></li>)}</ul>}</section>
     {status && <p role="status" className="progress-note">{status}</p>}
-    <InstanceProxy /></div>
     {editing && <UserForm user={editing === "new" ? undefined : editing} canDelete={editing !== "new" && editing.username !== username} close={() => setEditing(null)} saved={deleted => {
       setStatus(deleted ? t("用户已删除。") : editing === "new" ? t("用户已创建。") : t("用户已更新。")); setEditing(null); setRevision(n => n + 1);
     }} />}

@@ -612,3 +612,128 @@ fn repinned_model_keeps_its_name_and_invalidates_the_projection() -> Result<()> 
     assert!(selection.mismatches(&mut db)?);
     Ok(())
 }
+
+#[test]
+fn rebuild_resumes_only_verified_checkpoints_after_interruption() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut db = store::connect(home.path())?;
+    let count = Arc::new(AtomicUsize::new(0));
+    let requests = count.clone();
+    let server = Server::new(move |request| {
+        let attempt = requests.fetch_add(1, Ordering::SeqCst);
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let entries = body["input"].as_array().unwrap().len();
+        if attempt == 1 {
+            Reply::status(500)
+        } else {
+            Reply::json(
+                json!({"embeddings": vec![[1.0, 0.0]; entries], "prompt_eval_count": entries * 10}),
+            )
+        }
+    });
+    crate::ollama_settings::set_endpoints(&mut db, std::slice::from_ref(&server.url))?;
+    crate::ollama_settings::set(&mut db, Some(&server.url), Some(DEFAULT_MODEL))?;
+    set_backend(&mut db, "ollama")?;
+    for id in 1..=20 {
+        store::upsert(&mut db, &repo(id, 2025, "fixture", "Rust"))?;
+    }
+    assert!(build(&mut db, true, &|_| {}).is_err());
+    assert_eq!(generation(&mut db)?, 0);
+    assert_eq!(
+        embedding_checkpoints::table
+            .count()
+            .get_result::<i64>(&mut db)?,
+        16
+    );
+    drop(db);
+
+    let mut reopened = store::connect(home.path())?;
+    assert!(pending_rebuild(&mut reopened)?);
+    // A modified document and a corrupted checkpoint must both be recomputed.
+    store::upsert(&mut reopened, &repo(1, 2025, "changed", "Rust"))?;
+    diesel::update(embedding_checkpoints::table.filter(embedding_checkpoints::id.eq(2)))
+        .set(embedding_checkpoints::checksum.eq(vec![0]))
+        .execute(&mut reopened)?;
+    let last = std::cell::Cell::new(None);
+    crate::index_worker::build(&mut reopened, false, &|_| {}, &|counts| {
+        last.set(Some(counts))
+    })?;
+    let progress = last.get().context("missing resumed progress")?;
+    assert_eq!(
+        (
+            progress.resumed,
+            progress.repositories,
+            progress.chunks,
+            progress.tokens
+        ),
+        (14, 6, 6, Some(60))
+    );
+    assert_eq!(generation(&mut reopened)?, 1);
+    let status = serde_json::to_value(status::read(&mut reopened)?)?;
+    assert_eq!(status["state"], "ready");
+    assert_eq!(status["indexed"], 20);
+    assert!(status["projection_bytes"].as_u64().unwrap_or_default() > 0);
+    assert!(status["vector_bytes"].as_i64().unwrap_or_default() > 0);
+    assert!(status["last_published_at"].is_string());
+
+    assert_eq!(
+        embeddings::table.count().get_result::<i64>(&mut reopened)?,
+        20
+    );
+    assert_eq!(
+        embedding_checkpoints::table
+            .count()
+            .get_result::<i64>(&mut reopened)?,
+        0
+    );
+    assert!(store::meta(&mut reopened, "index_pending")?.is_none());
+    assert!(!pending_rebuild(&mut reopened)?);
+    assert_eq!(count.load(Ordering::SeqCst), 3);
+    Ok(())
+}
+
+#[test]
+fn collection_is_searchable_with_filters_before_any_semantic_index() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut account = store::connect(home.path())?;
+    let mut other = store::connect_as(home.path(), "other")?;
+    let rust = repo(1, 2025, "Rust source parser", "Rust");
+    let mut private_note = repo(2, 2025, "Source explorer", "Go");
+    store::upsert(&mut account, &rust)?;
+    store::upsert(&mut account, &private_note)?;
+    store::upsert(&mut other, &repo(3, 2025, "Rust source toolkit", "Rust"))?;
+    store::edit(
+        &mut account,
+        store::Edit {
+            id: private_note.id,
+            note: Some("Rust fixture note".into()),
+            ..Default::default()
+        },
+    )?;
+    private_note.note = "Rust fixture note".into();
+    let q = crate::library::Query {
+        query: "rust".into(),
+        limit: Some(10),
+        filter: Filter::default(),
+    };
+    let (matches, keyword) = crate::library::interactive_search(&mut account, &q)?;
+    assert!(keyword);
+    assert_eq!(matches.iter().map(|r| r.id).collect::<Vec<_>>(), [1, 2]);
+    assert_eq!(matches[1].note, private_note.note);
+    let q = crate::library::Query {
+        filter: Filter {
+            language: Some("Go".into()),
+            ..Default::default()
+        },
+        ..q
+    };
+    assert_eq!(
+        crate::library::interactive_search(&mut account, &q)?.0[0].id,
+        2
+    );
+    let fresh = serde_json::to_value(status::read(&mut account)?)?;
+    assert_eq!(fresh["state"], "unbuilt");
+    assert_eq!(fresh["repositories"], 2);
+    assert_eq!(fresh["indexed"], 0);
+    Ok(())
+}

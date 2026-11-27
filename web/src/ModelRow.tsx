@@ -20,7 +20,7 @@ export const statuses: Record<Status, string> = {
   missing: "未下载", downloading: "下载中", ready: "已就绪", failed: "下载失败",
 };
 
-function size(bytes: number) {
+export function formatBytes(bytes: number) {
   const units = ["B", "KiB", "MiB", "GiB", "TiB"];
   let quantity = Math.max(0, bytes);
   let unit = 0;
@@ -34,7 +34,7 @@ function DownloadProgress({ model }: { model: ModelFile }) {
   const known = total != null && total > 0;
   return <div className="model-progress">
     <progress aria-label={t("{0} 下载进度", model.label)} max={known ? total : undefined} value={known ? Math.min(received, total) : undefined} />
-    <small>{known ? t("已下载 {0} / {1}", size(received), size(total)) : t("已下载 {0}", size(received))}</small>
+    <small>{known ? t("已下载 {0} / {1}", formatBytes(received), formatBytes(total)) : t("已下载 {0}", formatBytes(received))}</small>
   </div>;
 }
 
@@ -63,7 +63,7 @@ export function ModelRow({ file, admin, active, source, refreshing, refresh }: {
   return <li>
         <div className="model-file-header"><div><strong>{file.label}</strong>
           {file.label !== file.id && <small>{file.id}</small>}
-          {file.status !== "downloading" && file.total_bytes != null && file.total_bytes > 0 && <small>{t("模型大小 {0}", size(file.total_bytes))}</small>}</div>
+          {file.status !== "downloading" && file.total_bytes != null && file.total_bytes > 0 && <small>{t("模型大小 {0}", formatBytes(file.total_bytes))}</small>}</div>
           <span className="model-state" data-status={file.status}>{t(active && file.status === "ready" ? "当前检索模型" : statuses[file.status])}</span></div>
         {file.status === "downloading" && <DownloadProgress model={file} />}
         {file.status === "failed" && file.error && <p className="model-error">{t(file.error)}</p>}

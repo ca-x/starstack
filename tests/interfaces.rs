@@ -276,6 +276,20 @@ fn http_accounts_confirmation_and_revocation() -> Result<()> {
     assert!(pending["local_command"].is_null());
     assert_eq!(settings(&reader)?["pending_sync"], pending["request_id"]);
     assert!(settings(&admin)?["pending_sync"].is_null());
+    let token_list = |cookie: &str| -> Result<Value> {
+        Ok(c.get(format!("{base}/api/tokens"))
+            .header("X-StarStack", "1")
+            .header(COOKIE, cookie)
+            .send()?
+            .error_for_status()?
+            .json()?)
+    };
+    let tokens = token_list(&reader)?;
+    assert_eq!(tokens["tokens"][0]["requests"], 2);
+    assert!(tokens["tokens"][0]["last_used_at"].is_string());
+    assert!(tokens["tokens"][0]["digest"].is_null());
+    assert_eq!(token_list(&admin)?["tokens"], json!([]));
+
     post(
         "users/update",
         &admin,
@@ -287,6 +301,7 @@ fn http_accounts_confirmation_and_revocation() -> Result<()> {
         401
     );
     assert_eq!(mcp(operation)?.status(), 401);
-    assert!(login("reader", "new-fixture-reader").is_ok());
+    let reader = login("reader", "new-fixture-reader")?;
+    assert_eq!(token_list(&reader)?["tokens"], json!([]));
     Ok(())
 }

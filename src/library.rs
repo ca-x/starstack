@@ -60,6 +60,23 @@ pub(crate) fn search(db: &mut Db, q: &Query) -> Result<Vec<Repo>> {
         result => result,
     }
 }
+pub(crate) fn interactive_search(db: &mut Db, q: &Query) -> Result<(Vec<Repo>, bool)> {
+    q.validate()?;
+    let limit = q.limit.unwrap_or(10);
+    if index::has_published_generation(db).unwrap_or(false)
+        && let Ok(rows) = index::search_with_timeout(
+            db,
+            &q.query,
+            &q.filter,
+            limit,
+            std::time::Duration::from_secs(10),
+        )
+    {
+        return Ok((rows, false));
+    }
+    Ok((store::keyword_search(db, &q.query, &q.filter, limit)?, true))
+}
+
 /// Keep long READMEs in the collection; cards and AI sources only need their metadata.
 pub(crate) fn cards(rows: Vec<Repo>) -> Vec<serde_json::Value> {
     rows.into_iter()

@@ -43,7 +43,7 @@ pub(crate) fn search(db: &mut Db, input: Search) -> Result<Value> {
             .append_pair("sort", "downloads")
             .append_pair("direction", "-1");
     }
-    let client = proxy::builder(db)?
+    let client = proxy::instance_builder(db)?
         .timeout(Duration::from_secs(25))
         .build()?;
     let response = client

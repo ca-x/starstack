@@ -61,6 +61,7 @@ pub(crate) fn panel(db: &mut Db) -> Result<Value> {
     Ok(
         json!({"backend":backend,"chunking":crate::chunking::parameters(db,&backend)?,"model":index::configured_model(db)?,
         "ollama_url":url,"ollama_model":model,"ollama_urls":endpoints,
+        "index_profile":crate::index_worker::Profile::load(db)?,"index_threads":crate::index_worker::Profile::options(),
         "index_issue":index_issue,"needs_rebuild":needs_rebuild,"models":models}),
     )
 }

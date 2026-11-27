@@ -2,7 +2,7 @@
 use crate::store::{self, Db, PRIMARY};
 use anyhow::{Context, Result, bail, ensure};
 use argon2::{Argon2, PasswordHash, PasswordHasher, PasswordVerifier, password_hash::SaltString};
-use diesel::prelude::*;
+use diesel::{connection::SimpleConnection, prelude::*};
 use reqwest::blocking::Client;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -14,7 +14,19 @@ use uuid::Uuid;
 
 diesel::table! {accounts(id){id->Text,username->Text,password_hash->Text,admin->Bool,disabled->Bool,revision->Integer,}}
 diesel::table! {access_tokens(id){id->Text,owner_id->Text,name->Text,digest->Text,created_at->Text,}}
-diesel::allow_tables_to_appear_in_same_query!(accounts, access_tokens);
+diesel::table! {mcp_token_usage(token_id){token_id->Text,requests->BigInt,last_used_at->Text,}}
+diesel::allow_tables_to_appear_in_same_query!(accounts, access_tokens, mcp_token_usage);
+
+fn ensure_usage_table(db: &mut Db) -> Result<()> {
+    db.batch_execute(
+        "CREATE TABLE IF NOT EXISTS mcp_token_usage (
+        token_id TEXT PRIMARY KEY NOT NULL REFERENCES access_tokens(id) ON DELETE CASCADE,
+        requests INTEGER NOT NULL,
+        last_used_at TEXT NOT NULL
+    )",
+    )?;
+    Ok(())
+}
 #[derive(Clone, Serialize, Queryable, Selectable)]
 #[diesel(table_name=accounts)]
 pub(crate) struct Account {
@@ -216,13 +228,24 @@ pub(crate) struct Token {
     id: String,
     name: String,
     created_at: String,
+    requests: Option<i64>,
+    last_used_at: Option<String>,
 }
 pub(crate) fn tokens(db: &mut Db) -> Result<Vec<Token>> {
     use access_tokens as t;
+    use mcp_token_usage as u;
+    ensure_usage_table(db)?;
     let user = store::owner(db)?;
     Ok(t::table
+        .left_join(u::table.on(t::id.eq(u::token_id)))
         .filter(t::owner_id.eq(user))
-        .select((t::id, t::name, t::created_at))
+        .select((
+            t::id,
+            t::name,
+            t::created_at,
+            u::requests.nullable(),
+            u::last_used_at.nullable(),
+        ))
         .order(t::created_at.desc())
         .load(db)?)
 }
@@ -265,18 +288,28 @@ pub(crate) fn revoke(db: &mut Db, id: &str) -> Result<()> {
     );
     Ok(())
 }
-pub(crate) fn bearer_owner(db: &mut Db, bearer: &str) -> Result<String> {
+pub(crate) fn bearer_owner(db: &mut Db, bearer: &str, track_post: bool) -> Result<String> {
     use access_tokens as t;
     ensure!(bearer.starts_with("sst_"), "无效 token");
-    Ok(t::table
+    let (owner, token): (String, String) = t::table
         .inner_join(accounts::table.on(accounts::id.eq(t::owner_id)))
         .filter(
             t::digest
                 .eq(digest(bearer))
                 .and(accounts::disabled.eq(false)),
         )
-        .select(t::owner_id)
-        .first(db)?)
+        .select((t::owner_id, t::id))
+        .first(db)?;
+    if track_post {
+        ensure_usage_table(db)?;
+        // The SELECT prevents resurrecting telemetry if the token was just revoked.
+        diesel::sql_query("INSERT INTO mcp_token_usage(token_id, requests, last_used_at)
+            SELECT id, 1, strftime('%Y-%m-%dT%H:%M:%fZ','now') FROM access_tokens WHERE id = ?
+            ON CONFLICT(token_id) DO UPDATE SET requests = requests + 1, last_used_at = excluded.last_used_at")
+            .bind::<diesel::sql_types::Text, _>(&token)
+            .execute(db)?;
+    }
+    Ok(owner)
 }
 fn environment_token() -> Option<String> {
     ["GITHUB_TOKEN", "GH_TOKEN"]

@@ -63,18 +63,33 @@ impl JobReport {
         }
     }
 }
-#[derive(Default)]
+#[derive(Default, Serialize)]
 struct Job {
     message: String,
     running: bool,
     report: Option<JobReport>,
     index_progress: Option<index::Progress>,
-    catalog_report: Option<JobReport>,
+}
+
+#[derive(Default)]
+struct AccountJobs {
+    latest: String,
+    stages: HashMap<String, Job>,
+}
+
+impl AccountJobs {
+    fn latest(&self) -> Option<&Job> {
+        self.stages.get(&self.latest)
+    }
+
+    fn running(&self) -> bool {
+        self.latest().is_some_and(|job| job.running)
+    }
 }
 struct App {
     base: Library,
     sessions: Mutex<HashMap<String, Session>>,
-    jobs: Mutex<HashMap<String, Job>>,
+    jobs: Mutex<HashMap<String, AccountJobs>>,
     model_download: Mutex<HashMap<String, Job>>,
     devices: Mutex<HashMap<String, PendingDevice>>,
     logins: Mutex<HashMap<String, (u32, Instant)>>,
@@ -435,7 +450,8 @@ async fn read(
             Ok(json!({"users": users}))
         }).await?,
         "users" => return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
-        "proxy" if a.admin=>lib.run(crate::proxy::read_settings).await?,
+        "proxy/account" => lib.run(move|db|crate::proxy::read_settings(db,a.revision,crate::proxy::Scope::Account)).await?,
+        "proxy" if a.admin=>lib.run(move|db|crate::proxy::read_settings(db,a.revision,crate::proxy::Scope::Instance)).await?,
         "proxy" | "proxy/test"=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
         "organize/job" => lib.run(crate::organizer::progress).await?,
         "models" => {
@@ -457,10 +473,18 @@ async fn read(
             panel
         }
         "settings"=>lib.run(settings).await?,
+        "index/status" => lib.run(|db| Ok(serde_json::to_value(index::status::read(db)?)?)).await?,
         "progress" => {
             let jobs = app.jobs.lock().expect("jobs lock poisoned");
-            let job = jobs.get(&a.id);
-            json!({"message":job.map_or("", |j| j.message.as_str()), "running":job.is_some_and(|j|j.running), "report":job.and_then(|j|j.report.as_ref()),"index_progress":job.and_then(|j|j.index_progress),"catalog_report":job.and_then(|j|j.catalog_report.as_ref())})
+            let account = jobs.get(&a.id);
+            let job = account.and_then(AccountJobs::latest);
+            json!({
+                "message":job.map_or("", |j| j.message.as_str()),
+                "running":job.is_some_and(|j|j.running),
+                "report":job.and_then(|j|j.report.as_ref()),
+                "index_progress":job.and_then(|j|j.index_progress),
+                "stages": account.map(|j| &j.stages)
+            })
         }
         _ => return Err(ApiError(StatusCode::NOT_FOUND,"没有此接口".into())),
     };
@@ -495,15 +519,17 @@ fn start_job(
 ) -> Result<tokio::task::JoinHandle<Result<JobReport>>> {
     {
         let mut jobs = app.jobs.lock().expect("jobs lock poisoned");
-        let item = jobs.entry(lib.user.clone()).or_default();
-        ensure!(!item.running, "同步或索引正在运行，请查看进度");
-        item.running = true;
-        item.message = "准备中".into();
-        item.report = None;
-        item.index_progress = None;
-        if operation != "index" {
-            item.catalog_report = None;
-        }
+        let account = jobs.entry(lib.user.clone()).or_default();
+        ensure!(!account.running(), "同步或索引正在运行，请查看进度");
+        account.latest = operation.to_owned();
+        account.stages.insert(
+            operation.to_owned(),
+            Job {
+                running: true,
+                message: "准备中".into(),
+                ..Job::default()
+            },
+        );
     }
     let op = operation.to_owned();
     Ok(tokio::spawn(async move { work(app, lib, op, input).await }))
@@ -511,6 +537,7 @@ fn start_job(
 async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Result<JobReport> {
     let catalog = operation == "sync";
     let task = operation.clone();
+    let finished_stage = operation.clone();
     let state = app.clone();
     let user = lib.user.clone();
     let result = lib
@@ -518,25 +545,15 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
             if let Some(id) = input.request_id {
                 library::approve(db, &id)?;
             }
-            let progress = |msg: &str| {
-                state
-                    .jobs
-                    .lock()
-                    .expect("jobs lock poisoned")
-                    .entry(user.clone())
-                    .or_default()
-                    .message = msg.into();
+            let update_stage = |update: &dyn Fn(&mut Job)| {
+                let mut jobs = state.jobs.lock().expect("jobs lock poisoned");
+                let account = jobs.entry(user.clone()).or_default();
+                update(account.stages.entry(operation.clone()).or_default());
             };
+            let progress = |msg: &str| update_stage(&|stage| stage.message = msg.into());
             let build_index = |db: &mut store::Db, rebuild| {
-                store::set_meta(db, "index_pending", "1")?;
-                let result = index::build_observed(db, rebuild, &progress, &|counts| {
-                    state
-                        .jobs
-                        .lock()
-                        .expect("jobs lock poisoned")
-                        .entry(user.clone())
-                        .or_default()
-                        .index_progress = Some(counts);
+                let result = crate::index_worker::build(db, rebuild, &progress, &|counts| {
+                    update_stage(&|stage| stage.index_progress = Some(counts));
                 });
                 if let Err(error) = &result
                     && !error.is::<index::BuildConflict>()
@@ -557,14 +574,10 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
                         "last_readme_attempt",
                         &chrono::Utc::now().timestamp().to_string(),
                     )?;
-                    let mut report =
-                        JobReport::from_sync(&crate::sync::enrich(db, &progress)?, false);
-                    if store::meta(db, "index_pending")?.is_some()
-                        && store::meta(db, "index_issue")?.is_none()
-                    {
-                        report.add_step(build_index(db, false), "索引待更新");
-                    }
-                    Ok(report)
+                    Ok(JobReport::from_sync(
+                        &crate::sync::enrich(db, &progress)?,
+                        false,
+                    ))
                 }
                 _ => {
                     let mut report = JobReport::from_sync(
@@ -609,7 +622,8 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
     }
     {
         let mut jobs = app.jobs.lock().expect("jobs lock poisoned");
-        let item = jobs.entry(lib.user.clone()).or_default();
+        let account = jobs.entry(lib.user.clone()).or_default();
+        let item = account.stages.entry(finished_stage.clone()).or_default();
         item.running = false;
         let mut report = match &result {
             Ok(report) => report.clone(),
@@ -626,15 +640,15 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
             report.warnings.push(format!("计划在 {time} 自动重试。"));
         }
         item.message.clone_from(&report.message);
-        if catalog {
-            item.catalog_report = Some(report.clone());
-        }
         item.report = Some(report);
     }
-    if catalog
+    if (catalog || finished_stage == "readme")
         && result.is_ok()
         && lib
-            .run(|db| Ok(store::meta(db, "index_pending")?.is_some()))
+            .run(move |db| {
+                Ok(store::meta(db, "index_pending")?.is_some()
+                    && (catalog || store::meta(db, "index_issue")?.is_none()))
+            })
             .await
             .unwrap_or(false)
     {
@@ -665,9 +679,14 @@ async fn write(
             let ask = path == "ask";
             if ask { q.limit=Some(5); }
             let question = q.query.clone();
-            let rows = lib.run(move|db| library::search(db,&q)).await?;
-            let answer = if ask { Some(ai::ask(&question,&rows).await?) } else { None };
-            json!({"repositories":library::cards(rows),"answer":answer})
+            let (rows, keyword) = lib.run(move|db| library::interactive_search(db,&q)).await?;
+            let (answer, answer_error) = if ask {
+                match ai::ask(&question,&rows).await {
+                    Ok(answer) => (Some(answer), None),
+                    Err(error) => (None, Some(error.to_string())),
+                }
+            } else { (None, None) };
+            json!({"repositories":library::cards(rows),"answer":answer,"answer_error":answer_error,"keyword_fallback":keyword})
         }
         "edit" => {
             let patch = value(body)?;
@@ -761,6 +780,13 @@ async fn write(
             lib.run(move|db|crate::chunking::save(db,input)).await?;
             json!({"message":"分块设置已保存"})
         }
+        "models/index-profile" => {
+            #[derive(Deserialize)]
+            struct Options { profile: crate::index_worker::Profile }
+            let options: Options = value(body)?;
+            lib.run(move|db|options.profile.save(db)).await?;
+            json!({"message":"索引挡位已保存"})
+        }
         "models/select" => {
             let selection=value(body)?;
             lib.run(move|db| crate::model_preferences::select(db,selection)).await?;
@@ -834,11 +860,16 @@ async fn write(
                 Err(error) => return Err(ApiError(StatusCode::BAD_REQUEST, error.to_string())),
             }
         }
+        "proxy/account/test" => {
+            let candidate=body.get("candidate").cloned().unwrap_or(Value::Null);
+            lib.run(move|db|crate::proxy::test_connection(db,candidate,a.revision,crate::proxy::Scope::Account)).await?
+        }
+        "proxy/account" => lib.run(move|db|crate::proxy::save_settings(db,body,a.revision,crate::proxy::Scope::Account)).await?,
         "proxy/test" if a.admin=> {
             let candidate=body.get("candidate").cloned().unwrap_or(Value::Null);
-            lib.run(move|db|crate::proxy::test_connection(db,candidate,a.revision)).await?
+            lib.run(move|db|crate::proxy::test_connection(db,candidate,a.revision,crate::proxy::Scope::Instance)).await?
         }
-        "proxy" if a.admin=>lib.run(move|db|crate::proxy::save_settings(db,body,a.revision)).await?,
+        "proxy" if a.admin=>lib.run(move|db|crate::proxy::save_settings(db,body,a.revision,crate::proxy::Scope::Instance)).await?,
         "proxy" | "proxy/test"=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
         "settings"=>{
             let q:Settings=value(body)?;
@@ -981,9 +1012,10 @@ async fn serve_mcp_request(app: Shared, req: Request) -> Api<Response> {
         .and_then(|v| v.strip_prefix("Bearer "))
         .ok_or_else(unauthorized)?
         .to_owned();
+    let track_post = req.method() == Method::POST;
     let user = app
         .base
-        .run(move |db| auth::bearer_owner(db, &bearer))
+        .run(move |db| auth::bearer_owner(db, &bearer, track_post))
         .await
         .map_err(|_| unauthorized())?;
     let library = tenant(&app, &user);
@@ -1049,17 +1081,21 @@ async fn schedule(app: Shared) {
                 .lock()
                 .expect("jobs lock poisoned")
                 .get(&a.id)
-                .is_some_and(|j| j.running)
+                .is_some_and(AccountJobs::running)
             {
                 continue;
             }
             let due = lib
                 .run(|db| {
                     db.immediate_transaction(|db| {
-                        if store::meta(db, "index_pending")?.is_some()
-                            && store::meta(db, "index_issue")?.is_none()
-                        {
-                            return Ok(Some("index"));
+                        if store::meta(db, "index_issue")?.is_none() {
+                            let pending = store::meta(db, "index_pending")?.is_some();
+                            let needs_first_index = store::meta(db, "index_generation")?
+                                .is_none_or(|value| value == "0")
+                                && store::has_active_repositories(db)?;
+                            if pending || needs_first_index {
+                                return Ok(Some("index"));
+                            }
                         }
                         if !auth::has_github_credentials(db)? {
                             return Ok(None);

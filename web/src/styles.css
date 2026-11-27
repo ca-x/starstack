@@ -51,11 +51,8 @@ h3 { font-size: 17px; }
 .skip:focus { top: 10px; }
 .workspace { padding: 38px clamp(24px,4vw,56px) 64px; width: 100%; max-width: 1380px; margin-inline: auto; min-width: 0; }
 .workspace--settings { margin-inline: 0; padding-inline: clamp(20px, 3.5vw, 52px); max-width: 1320px; }
-.user-settings-grid { display: grid; grid-template-columns: minmax(0, 1.2fr) minmax(0, 1fr); gap: 18px; align-items: start; }
-.user-settings-grid .proxy-panel { margin-top: 0; }
-.user-settings-grid + .progress-note { margin-top: 12px; }
-@media (max-width: 1120px) { .user-settings-grid { grid-template-columns: minmax(0, 1fr); } }
-.workspace:focus { outline: none; }
+.connection-panels { display: grid; gap: 18px; max-width: 770px; }
+.collection + .progress-note { margin-top: 12px; }
 .page-heading { margin-bottom: 24px; }
 .page-heading p,.operation p,.login-caption,.subdued,.empty p { color: var(--muted); }
 .page-heading p { margin-top: 8px; }
@@ -368,11 +365,45 @@ body .workspace[tabindex="-1"]:focus { outline: none !important; }
 .retry-settings legend { padding: 0 5px; font-weight: 650; }
 .retry-settings .row-controls { gap: 10px 22px; margin-top: 10px; }
 
-.index-job-progress { margin-top: 10px; }
-.index-job-progress progress { width: 100%; height: 8px; accent-color: var(--accent); }
+.index-job-progress { margin-top: 10px; display: flex; flex-wrap: wrap; align-items: center; gap: 8px 16px; }
 .index-job-progress dl { display: flex; flex-wrap: wrap; gap: 8px 24px; margin: 8px 0 0; }
 .index-job-progress dt { font-size: 12px; color: var(--muted); }
 .index-job-progress dd { margin: 0; font-variant-numeric: tabular-nums; }
 .model-index-notice { display: flex; flex-wrap: wrap; align-items: center; justify-content: space-between; gap: 10px; animation: index-notice-pulse 250ms ease-out 1; }
 @keyframes index-notice-pulse { 0%, 100% { opacity: 1; } 40% { opacity: 0.76; } }
 @media (prefers-reduced-motion: reduce) { .model-index-notice { animation: none; } }
+
+.index-overview { justify-items: stretch; }
+.index-overview-title { display: flex; flex-wrap: wrap; align-items: baseline; justify-content: space-between; gap: 4px 16px; }
+.index-overview-title span, .index-coverage span { color: var(--muted); font-size: 13px; }
+.index-coverage { display: flex; align-items: center; gap: 14px; }
+.index-coverage > div:last-child { display: grid; gap: 2px; }
+.index-coverage > div:last-child strong { font-variant-numeric: tabular-nums; }
+.index-overview-facts { margin: 0; display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 138px), 1fr)); gap: 10px 18px; }
+.index-overview-facts dt { font-size: 12px; color: var(--muted); }
+.index-overview-facts dd { margin: 2px 0 0; font-variant-numeric: tabular-nums; }
+.index-storage-details .index-overview-facts { margin-top: 10px; }
+
+.water-level { --water: color-mix(in srgb, var(--accent) 28%, var(--surface)); position: relative; isolation: isolate; overflow: hidden; display: grid; place-items: center; width: 68px; height: 68px; flex: none; border: 1px solid var(--rule); border-radius: 50%; background: var(--surface); }
+.water-level strong { position: relative; font-size: 15px; font-variant-numeric: tabular-nums; }
+.water-fill { position: absolute; inset: 0; background: var(--water); }
+.water-surface { position: absolute; height: 5px; top: -4px; left: 0; right: -24px; background: radial-gradient(ellipse 12px 8px at 12px 8px, var(--water) 98%, transparent) 0 0 / 24px 8px repeat-x; }
+.water-level[data-empty="true"] .water-fill { visibility: hidden; }
+@keyframes water-flow { to { transform: translateX(-24px); } }
+@media (prefers-reduced-motion: no-preference) {
+  .water-fill { transition: transform 220ms cubic-bezier(0.23, 1, 0.32, 1); }
+  .water-level[data-moving="true"] .water-surface { animation: water-flow 1400ms linear infinite; }
+}
+
+.token-usage-receipt { width: min(100%, 520px); border: 1px solid var(--rule); background: var(--surface); border-radius: 8px; }
+.token-usage-receipt summary { padding: 10px 14px; cursor: pointer; }
+.token-usage-receipt summary strong { float: inline-end; margin-inline-start: 10px; font-variant-numeric: tabular-nums; }
+.token-usage-lines { padding: 10px 14px 13px; border-top: 1px dashed var(--rule); }
+.token-usage-lines dl { margin: 0; display: grid; gap: 6px; }
+.token-usage-lines dl div { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 4px 14px; }
+.token-usage-lines dd { margin: 0; font-variant-numeric: tabular-nums; }
+.token-usage-lines p { font-size: 12px; }
+.keyword-notice { display: flex; flex-wrap: wrap; justify-content: space-between; gap: 8px 14px; }
+
+.maintenance-stage:empty { display: none; }
+.sync-overview { min-width: min(100%, 310px); }

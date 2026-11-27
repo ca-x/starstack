@@ -44,6 +44,8 @@ export function Library({ stats, initial, revision, onEdit, onSync, tagLink }: {
   const [query, setQuery] = useState("");
   const [mode, setMode] = useState<"search" | "ask">("search");
   const [answer, setAnswer] = useState("");
+  const [answerError, setAnswerError] = useState("");
+  const [keyword, setKeyword] = useState(false);
   const [page, setPage] = useState(0);
   const [pageSize, setPageSize] = useState(25);
   const [showFilters, setShowFilters] = useState(false);
@@ -63,8 +65,10 @@ export function Library({ stats, initial, revision, onEdit, onSync, tagLink }: {
     setLoading(true);
     setError("");
     setAnswer("");
+    setAnswerError("");
+    setKeyword(false);
     const body = query ? { ...filters, query, ...(mode === "search" && { limit: pageSize }) } : { ...filters, sort, limit: pageSize, offset: page * pageSize };
-    api<{ repositories: Repo[]; total?: number; answer?: string }>(query ? mode : "list", body, controller.signal)
+    api<{ repositories: Repo[]; total?: number; answer?: string; answer_error?: string; keyword_fallback?: boolean }>(query ? mode : "list", body, controller.signal)
       .then(data => {
         if (controller.signal.aborted) return;
         const count = data.total ?? data.repositories.length;
@@ -73,6 +77,8 @@ export function Library({ stats, initial, revision, onEdit, onSync, tagLink }: {
           return;
         }
         setAnswer(data.answer || "");
+        setAnswerError(data.answer_error || "");
+        setKeyword(data.keyword_fallback === true);
         setRepos(data.repositories);
         setTotal(count);
       })
@@ -135,6 +141,10 @@ export function Library({ stats, initial, revision, onEdit, onSync, tagLink }: {
     </section>
     {!initial.pinned && !initial.tag && !query && Object.keys(stats.tags).length > 0 &&
       <TagCloud values={stats.tags} tagLink={tagLink} compact />}
+    {query && !loading && keyword && <div className="progress-note keyword-notice" role="status">
+      <span>{t("语义索引暂不可用，当前显示关键词结果。")}</span><a href="#sync/index">{t("查看索引设置")}</a>
+    </div>}
+    {answerError && <Failure error={t(answerError)} retry={() => setRetry(i => i + 1)} />}
     {answer && <section className="ai-answer"><h2>{t("推荐结果")}</h2><p>{answer}</p></section>}
     <section className="collection" aria-labelledby="results-heading">
       <div className="result-head"><h2 id="results-heading">{query ? (mode === "ask" ? t("引用仓库") : t("相关仓库")) : t("仓库列表")}

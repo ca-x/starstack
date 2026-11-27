@@ -163,10 +163,10 @@ fn shared_configuration_is_redacted_and_requires_current_admin() -> Result<()> {
     primary.batch_execute("INSERT INTO accounts VALUES ('primary','admin','fixture',1,0,2),('reader','reader','fixture',0,0,1)")?;
     let mut reader = store::connect_as(dir.path(), "reader")?;
     let update = json!({"mode":"custom","url":"socks5h://fixture:never-echo@[::1]:1080"});
-    assert!(read_settings(&mut reader).is_err());
-    assert!(persist(&mut reader, update.clone(), 1, None).is_err());
-    assert!(persist(&mut primary, update.clone(), 1, None).is_err());
-    let status = persist(&mut primary, update, 2, None)?;
+    assert!(read_settings(&mut reader, 1, Scope::Instance).is_err());
+    assert!(persist(&mut reader, update.clone(), 1, None, Scope::Instance).is_err());
+    assert!(persist(&mut primary, update.clone(), 1, None, Scope::Instance).is_err());
+    let status = persist(&mut primary, update, 2, None, Scope::Instance)?;
     assert_eq!(status["address"], "socks5h://[::1]:1080");
     assert_eq!(status["has_credentials"], true);
     assert!(!status.to_string().contains("never-echo"));
@@ -185,7 +185,8 @@ fn shared_configuration_is_redacted_and_requires_current_admin() -> Result<()> {
             &mut primary,
             json!({"mode":"direct"}),
             2,
-            Some("http://proxy.invalid".into())
+            Some("http://proxy.invalid".into()),
+            Scope::Instance
         )
         .is_err()
     );
@@ -195,16 +196,112 @@ fn shared_configuration_is_redacted_and_requires_current_admin() -> Result<()> {
         "http://x:bogus",
         "https://x/path?q=never-echo",
     ] {
-        let error = persist(&mut primary, json!({"mode":"custom","url":bad}), 2, None).unwrap_err();
+        let error = persist(
+            &mut primary,
+            json!({"mode":"custom","url":bad}),
+            2,
+            None,
+            Scope::Instance,
+        )
+        .unwrap_err();
         assert!(!format!("{error:#}").contains(bad));
     }
     assert_eq!(
-        persist(&mut primary, json!({"mode":"direct"}), 2, None)?["mode"],
+        persist(
+            &mut primary,
+            json!({"mode":"direct"}),
+            2,
+            None,
+            Scope::Instance
+        )?["mode"],
         "direct"
     );
     assert_eq!(
-        persist(&mut primary, json!({"mode":"system"}), 2, None)?["source"],
+        persist(
+            &mut primary,
+            json!({"mode":"system"}),
+            2,
+            None,
+            Scope::Instance
+        )?["source"],
         "system"
+    );
+    Ok(())
+}
+
+#[test]
+fn account_proxy_is_isolated_and_instance_environment_has_precedence() -> Result<()> {
+    let dir = tempfile::tempdir()?;
+    let mut primary = store::connect_as(dir.path(), store::PRIMARY)?;
+    primary.batch_execute("INSERT INTO accounts VALUES ('primary','admin','fixture',1,0,2),('reader','reader','fixture',0,0,1)")?;
+    let mut reader = store::connect_as(dir.path(), "reader")?;
+    persist(
+        &mut primary,
+        json!({"mode":"direct"}),
+        2,
+        None,
+        Scope::Instance,
+    )?;
+    assert_eq!(
+        settings(&mut reader, Scope::Account, None)?["mode"],
+        "inherit"
+    );
+    assert!(matches!(
+        scoped_config(&mut reader, Scope::Account, None)?,
+        ProxyConfig::Direct
+    ));
+    let saved = persist(
+        &mut reader,
+        json!({"mode":"custom","url":"socks5h://reader:private@tenant.invalid:1080"}),
+        1,
+        None,
+        Scope::Account,
+    )?;
+    assert_eq!(saved["address"], "socks5h://tenant.invalid:1080");
+    assert!(!saved.to_string().contains("private"));
+    assert!(matches!(
+        scoped_config(&mut primary, Scope::Account, None)?,
+        ProxyConfig::Direct
+    ));
+    assert!(matches!(
+        scoped_config(&mut reader, Scope::Instance, None)?,
+        ProxyConfig::Direct
+    ));
+    let operator = Some("http://operator.invalid".into());
+    assert_eq!(
+        settings(&mut reader, Scope::Account, operator.clone())?["source"],
+        "environment"
+    );
+    assert!(
+        matches!(scoped_config(&mut reader, Scope::Account, operator.clone())?, ProxyConfig::Custom(url) if url.host_str()==Some("operator.invalid"))
+    );
+    assert!(
+        persist(
+            &mut reader,
+            json!({"mode":"system"}),
+            1,
+            operator,
+            Scope::Account
+        )
+        .is_err()
+    );
+    persist(
+        &mut reader,
+        json!({"mode":"inherit"}),
+        1,
+        None,
+        Scope::Account,
+    )?;
+    assert!(account_config(&mut reader)?.is_none());
+    assert!(
+        persist(
+            &mut reader,
+            json!({"mode":"system"}),
+            0,
+            None,
+            Scope::Account
+        )
+        .is_err()
     );
     Ok(())
 }

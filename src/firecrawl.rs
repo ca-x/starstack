@@ -1,4 +1,4 @@
-//! Local GitHub README extraction. Networking follows the instance proxy; parsing stays in-process.
+//! Local GitHub README extraction. Networking uses the account proxy; parsing stays in-process.
 use crate::proxy::ProxyConfig;
 use anyhow::Result;
 

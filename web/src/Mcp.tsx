@@ -1,10 +1,28 @@
-import { t } from "./locale";
+import { getLocale, t } from "./locale";
 import { useEffect, useState, type FormEvent } from "react";
 import { EuiButton, EuiButtonEmpty, EuiCopy, EuiFieldText, EuiFormRow, EuiSwitch } from "@elastic/eui";
 import { api, date, message } from "./api";
 import { Failure } from "./shared";
 
-interface Token { id: string; name: string; created_at: string }
+interface Token { id: string; name: string; created_at: string; requests: number | null; last_used_at: string | null }
+
+function UsageReceipt({ tokens }: { tokens: Token[] }) {
+  const number = new Intl.NumberFormat(getLocale());
+  const requests = tokens.reduce((sum, token) => sum + (token.requests ?? 0), 0);
+  const first = tokens.reduce<string | null>((latest, token) =>
+    token.last_used_at && (!latest || token.last_used_at > latest) ? token.last_used_at : latest, null);
+  return <details className="token-usage-receipt">
+    <summary>{t("令牌使用小票")} <strong>{requests === 1 ? t("1 次请求") : t("{0} 次请求", number.format(requests))}</strong></summary>
+    <div className="token-usage-lines">
+      <dl>
+        <div><dt>{t("有效令牌")}</dt><dd>{number.format(tokens.length)}</dd></div>
+        <div><dt>{t("已认证请求")}</dt><dd>{number.format(requests)}</dd></div>
+        <div><dt>{t("最近使用")}</dt><dd>{first ? date(first, true) : t("尚无使用记录")}</dd></div>
+      </dl>
+      <p>{t("统计此版本起有效令牌的 MCP HTTP POST 请求。")}</p>
+    </div>
+  </details>;
+}
 
 function ModelPreference() {
   const [enabled, setEnabled] = useState<boolean>();
@@ -53,10 +71,18 @@ export function Mcp() {
   useEffect(() => {
     const controller = new AbortController();
     setListError("");
-    api<{ tokens: Token[] }>("tokens", undefined, controller.signal).then(data => {
-      if (!controller.signal.aborted) { setTokens(data.tokens); setLoaded(true); }
-    }).catch(e => { if (!controller.signal.aborted) setListError(message(e)); });
-    return () => controller.abort();
+    let timer: number;
+    async function load() {
+      try {
+        const data = await api<{ tokens: Token[] }>("tokens", undefined, controller.signal);
+        if (!controller.signal.aborted) { setTokens(data.tokens); setLoaded(true); setListError(""); }
+      } catch (e) {
+        if (!controller.signal.aborted) setListError(message(e));
+      }
+      if (!controller.signal.aborted) timer = window.setTimeout(load, 10000);
+    }
+    void load();
+    return () => { controller.abort(); clearTimeout(timer); };
   }, [revision]);
 
   async function create(e: FormEvent) {
@@ -85,6 +111,7 @@ export function Mcp() {
         <p>{t("在客户端设置请求头")}<code>{t("Authorization: Bearer <令牌>")}</code></p></section>
       <ModelPreference />
       <section className="operation"><h2>{t("访问令牌")}</h2>
+        {loaded && <UsageReceipt tokens={tokens} />}
         {secret ? <div className="token-secret"><EuiFormRow label={t("新令牌")} helpText={t("完整令牌仅在这里显示一次，请复制并妥善保存。")} fullWidth>
           <EuiFieldText fullWidth value={secret} readOnly onFocus={e => e.target.select()} /></EuiFormRow>
           <div className="row-controls"><CopyButton text={secret} label={t("复制令牌")} />
@@ -94,7 +121,9 @@ export function Mcp() {
         {error && <Failure error={error} />}{status && <p role="status">{status}</p>}
         {listError ? <Failure error={listError} retry={() => setRevision(n => n + 1)} /> : !loaded ? <p role="status">{t("正在读取令牌…")}</p> :
           tokens.length ? <ul className="token-list">{tokens.map(token => <li key={token.id}>
-            <div><strong>{token.name}</strong><small>{t("创建于")} {date(token.created_at, true)}</small></div>
+            <div><strong>{token.name}</strong><small>{t("创建于")} {date(token.created_at, true)}</small>
+              <small>{token.requests === 1 ? t("1 次请求") : t("{0} 次请求", (token.requests ?? 0).toLocaleString(getLocale()))}
+                {token.last_used_at && <> · {t("最近使用")} {date(token.last_used_at, true)}</>}</small></div>
             <div className="row-controls">{confirm === token.id ? <><EuiButton size="s" color="danger" isLoading={busy} onClick={() => revoke(token.id)}>{t("确认撤销")}</EuiButton>
               <EuiButtonEmpty size="s" isDisabled={busy} onClick={() => setConfirm("")}>{t("取消")}</EuiButtonEmpty></> :
               <EuiButtonEmpty size="s" color="danger" isDisabled={busy} onClick={() => setConfirm(token.id)}>{t("撤销")}</EuiButtonEmpty>}</div></li>)}</ul> : <p>{t("暂无访问令牌。")}</p>}

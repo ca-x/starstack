@@ -5,6 +5,7 @@ mod chat_settings;
 mod chunking;
 mod firecrawl;
 mod index;
+mod index_worker;
 mod library;
 mod lists;
 mod mcp;
@@ -73,6 +74,13 @@ enum Command {
     Index {
         #[arg(long)]
         rebuild: bool,
+    },
+    #[command(hide = true)]
+    IndexWorker {
+        #[arg(long)]
+        data_dir: PathBuf,
+        #[arg(long)]
+        owner: String,
     },
     /// 管理本机模型、下载来源与检索后端
     Models {
@@ -207,6 +215,9 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 }
 fn run() -> Result<()> {
     let cli = Cli::parse();
+    if let Command::IndexWorker { data_dir, owner } = &cli.command {
+        return index_worker::run(data_dir, owner);
+    }
     let progress = progress_reporter();
     let lib = Library {
         dir: store::home()?,
@@ -264,6 +275,9 @@ fn run() -> Result<()> {
             println!("{report}");
             ensure!(report.sync.failed == 0, "部分仓库同步失败，请重新运行 sync");
             ensure!(report.index_ready, "请按提示运行 starstack index");
+        }
+        Command::IndexWorker { .. } => {
+            unreachable!("worker command handled before opening CLI database")
         }
         Command::Index { rebuild } => println!("{}", index::build(&mut db, rebuild, &progress)?),
         Command::Models { action } => match action.unwrap_or(ModelAction::List) {

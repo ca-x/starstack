@@ -502,6 +502,67 @@ pub(crate) fn eligible<'a>(
     }
     q
 }
+pub(crate) fn has_active_repositories(db: &mut Db) -> Result<bool> {
+    use repositories as r;
+    let user = owner(db)?;
+    Ok(diesel::select(diesel::dsl::exists(
+        r::table.filter(r::owner_id.eq(user).and(r::active.eq(true))),
+    ))
+    .get_result(db)?)
+}
+
+pub(crate) fn keyword_search(
+    db: &mut Db,
+    query: &str,
+    filter: &Filter,
+    limit: usize,
+) -> Result<Vec<Repo>> {
+    use diesel::{dsl::sql, sql_types::Text};
+    use repositories as r;
+    let terms: Vec<_> = query
+        .split(|c: char| !c.is_alphanumeric() && !"+#_-".contains(c))
+        .filter(|term| !term.is_empty())
+        .take(12)
+        .map(str::to_lowercase)
+        .collect();
+    if terms.is_empty() {
+        return Ok(Vec::new());
+    }
+    let phrase = query.trim().to_lowercase();
+    db.transaction(|db| {
+        let user = owner(db)?;
+        let (name, text) = (
+            sql::<Text>("COALESCE(json_extract(metadata,'$.full_name'), '')"),
+            sql::<Text>(
+                "printf('%s %s %s %s %s %s',
+                json_extract(metadata,'$.description'), json_extract(metadata,'$.language'),
+                json_extract(metadata,'$.topics'), tags, note, summary)",
+            ),
+        );
+        let mut matches = Vec::new();
+        for row in eligible(user, filter)
+            .select((r::id, name, text))
+            .load_iter::<(i64, String, String), _>(db)?
+        {
+            let (id, name, text) = row?;
+            let (name, text) = (name.to_lowercase(), text.to_lowercase());
+            let mut score = usize::from(name.contains(&phrase)) * 4;
+            for term in &terms {
+                score += 3 * usize::from(name.contains(term)) + usize::from(text.contains(term));
+            }
+            if score > 0 {
+                matches.push((std::cmp::Reverse(score), id));
+            }
+        }
+        matches.sort_unstable();
+        matches
+            .into_iter()
+            .take(limit)
+            .map(|(_, id)| by_id(db, id))
+            .collect()
+    })
+}
+
 fn ordered<'a>(
     owner: String,
     filter: &'a Filter,

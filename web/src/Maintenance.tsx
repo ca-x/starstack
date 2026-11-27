@@ -6,6 +6,7 @@ import { EmbeddingModels } from "./EmbeddingModels";
 import { ChatSettings } from "./ChatSettings";
 import { Schedule } from "./Schedule";
 import { Failure } from "./shared";
+import { WaterLevel } from "./WaterLevel";
 
 interface Device { code: string; user_code: string; verification_uri: string; interval: number; expires_in: number }
 
@@ -99,43 +100,37 @@ const tabs = [
 
 export interface JobReport { message: string; warnings: string[]; details: string[] }
 export interface IndexProgress {
-  repositories: number; total: number; reused: number; chunks: number; tokens: number | null; elapsed_seconds: number;
+  repositories: number; total: number; reused: number; resumed?: number; chunks: number; tokens: number | null; elapsed_seconds: number;
 }
 export type Job = "sync" | "index" | "readmes";
-export function Maintenance({ stats, admin, job, progress, indexProgress, catalogReport, report, error, run }: {
-  stats: Stats; admin: boolean; job: Job | null; progress: string; indexProgress?: IndexProgress; catalogReport?: JobReport; report: JobReport | undefined; error: string; run: (job: Job, full: boolean, requestId?: string) => Promise<void>;
+export const stageFor = (job: Job) => job === "readmes" ? "readme" : job;
+type Stage = ReturnType<typeof stageFor>;
+export type TaskStages = Partial<Record<Stage, {
+  message: string; running: boolean; report?: JobReport | null; index_progress?: IndexProgress | null;
+}>>;
+
+export function Maintenance({ stats, admin, job, stages, error, initialTab, run }: {
+  stats: Stats; admin: boolean; job: Job | null; stages: TaskStages; error?: { job: Job; error: string };
+  initialTab: "sync" | "index"; run: (job: Job, full: boolean, requestId?: string) => Promise<void>;
 }) {
-  const [active, setActive] = useState<(typeof tabs)[number][0]>("sync");
-  const [modelNoticeTarget, setModelNoticeTarget] = useState<HTMLDivElement | null>(null);
-  function openTab(id: "market" | "index") {
-    setActive(id);
-    document.getElementById(`maintenance-tab-${id}`)?.focus();
+  const [active, setActive] = useState<(typeof tabs)[number][0]>(initialTab);
+  const stage = active === "index" || active === "sync" ? active : active === "schedule" ? "readme" : undefined;
+  const status = stage && stages[stage];
+  const progress = status ? jobText(status.message) : "";
+  const report = status ? status.report : undefined;
+  const indexProgress = status ? status.index_progress : undefined;
+  const running = !!job || Object.values(stages).some(item => item?.running);
+  const stageError = error && stageFor(error.job) === stage ? error.error : "";
+  function openMarket() {
+    setActive("market");
+    document.getElementById("maintenance-tab-market")?.focus();
   }
   const number = new Intl.NumberFormat(getLocale());
+  const resumed = indexProgress?.resumed ?? 0;
+  const requested = (indexProgress?.total ?? 0) + resumed;
+  const completed = (indexProgress?.repositories ?? 0) + resumed;
   return <>
     <div className="page-heading"><div><h1>{t("同步与索引")}</h1><p>{t("连接 GitHub、更新收藏并维护本地语义索引。")}</p></div></div>
-    <div ref={setModelNoticeTarget} />
-    {progress && <div className={`job-notice${report?.warnings.length ? " job-notice--warning" : ""}`}>
-      <div role="status"><strong>{progress}</strong>{report?.warnings.map((warning, i) => <p key={i}>{t(warning)}</p>)}</div>
-      {indexProgress && <div className="index-job-progress">
-        {indexProgress.total > 0 && <progress aria-label={t("仓库向量计算进度")} value={indexProgress.repositories} max={indexProgress.total} />}
-        <dl>
-          <div><dt>{t("新计算仓库")}</dt><dd>{number.format(indexProgress.repositories)} / {number.format(indexProgress.total)}</dd></div>
-          <div><dt>{t("复用仓库")}</dt><dd>{number.format(indexProgress.reused)}</dd></div>
-          <div><dt>{t("已处理文本块")}</dt><dd>{number.format(indexProgress.chunks)}</dd></div>
-          <div><dt>{t("已处理 token")}</dt><dd>{indexProgress.tokens === null ? t("服务未报告") : number.format(indexProgress.tokens)}</dd></div>
-          <div><dt>{t("计算用时（秒）")}</dt><dd>{number.format(indexProgress.elapsed_seconds)}</dd></div>
-        </dl>
-      </div>}
-      {catalogReport && catalogReport.message !== report?.message && (
-        <details><summary>{jobText(catalogReport.message)}</summary>
-          {[...catalogReport.warnings, ...catalogReport.details].map((entry, i) => <p key={i}>{t(entry)}</p>)}
-        </details>
-      )}
-      {!!report?.details.length && <details><summary>{t("任务日志")}</summary><ul>{report.details.map((detail, i) =>
-        <li key={i}>{t(detail)}</li>)}</ul></details>}
-    </div>}
-    {error && !report?.warnings.length && <Failure error={error} />}
     <EuiTabs className="maintenance-tabs" aria-label={t("同步与索引")} onKeyDown={event => {
       const current = tabs.findIndex(([id]) => id === active);
       const next = event.key === "ArrowRight" ? (current + 1) % tabs.length :
@@ -150,18 +145,41 @@ export function Maintenance({ stats, admin, job, progress, indexProgress, catalo
       {tabs.map(([id, label]) => <EuiTab key={id} id={`maintenance-tab-${id}`} aria-controls={`maintenance-panel-${id}`}
         tabIndex={active === id ? 0 : -1} isSelected={active === id} onClick={() => setActive(id)}>{t(label)}</EuiTab>)}
     </EuiTabs>
+    <div className="maintenance-stage">
+    {progress && <div className={`job-notice${report?.warnings.length ? " job-notice--warning" : ""}`}>
+      <div role="status"><strong>{progress}</strong>{report?.warnings.map((warning, i) => <p key={i}>{jobText(warning)}</p>)}</div>
+      {indexProgress && <div className="index-job-progress">
+        {requested > 0 && <WaterLevel value={completed} total={requested} label={t("仓库向量计算进度")} moving={!!stages.index?.running} />}
+        <dl>
+          <div><dt>{t("新计算仓库")}</dt><dd>{number.format(indexProgress.repositories)} / {number.format(indexProgress.total)}</dd></div>
+          {!!indexProgress.resumed && <div><dt>{t("断点接续")}</dt><dd>{number.format(indexProgress.resumed)}</dd></div>}
+          <div><dt>{t("复用仓库")}</dt><dd>{number.format(indexProgress.reused)}</dd></div>
+          <div><dt>{t("已处理文本块")}</dt><dd>{number.format(indexProgress.chunks)}</dd></div>
+          <div><dt>{t("已处理 token")}</dt><dd>{indexProgress.tokens === null ? t("服务未报告") : number.format(indexProgress.tokens)}</dd></div>
+          <div><dt>{t("计算用时（秒）")}</dt><dd>{number.format(indexProgress.elapsed_seconds)}</dd></div>
+        </dl>
+      </div>}
+      {!!report?.details.length && <details><summary>{t("任务日志")}</summary><ul>{report.details.map((detail, i) =>
+        <li key={i}>{jobText(detail)}</li>)}</ul></details>}
+    </div>}
+    {stageError && !report?.warnings.length && <Failure error={stageError} />}
+    </div>
     <div className="operations" hidden={active !== "sync"} role="tabpanel" id="maintenance-panel-sync" aria-labelledby="maintenance-tab-sync"><DeviceAuth />
       <section className="operation"><div><h2>{t("同步收藏")}</h2><p>{t("增量同步读取最近收藏。全量同步重新核对 GitHub 上的完整 Stars 列表。")}</p></div>
-        <dl className="inline-fact"><dt>{t("上次同步")}</dt><dd>{date(stats.last_sync, true)}</dd></dl>
-        <div className="row-controls"><EuiButton fill isDisabled={!!job} onClick={() => run("sync", false)}>{t("增量同步")}</EuiButton>
-          <EuiButton isDisabled={!!job} onClick={() => run("sync", true)}>{t("全量同步")}</EuiButton></div></section>
+        <dl className="index-overview-facts sync-overview">
+          <div><dt>{t("已导入收藏")}</dt><dd>{number.format(stats.total)}</dd></div>
+          <div><dt>{t("上次同步")}</dt><dd>{date(stats.last_sync, true)}</dd></div>
+        </dl>
+        <div className="row-controls"><EuiButton fill isDisabled={running} onClick={() => run("sync", false)}>{t("增量同步")}</EuiButton>
+          <EuiButton isDisabled={running} onClick={() => run("sync", true)}>{t("全量同步")}</EuiButton></div></section>
     </div>
-    <EmbeddingModels active={active} noticeTarget={modelNoticeTarget} openMarket={() => openTab("market")} openIndex={() => openTab("index")} admin={admin} jobActive={!!job} index={rebuild => run("index", rebuild)} fallbackModel={stats.model} />
+    <EmbeddingModels active={active} indexRunning={job === "index" || !!stages.index?.running} openMarket={openMarket}
+      admin={admin} jobActive={running} index={rebuild => run("index", rebuild)} fallbackModel={stats.model} />
     <div className="operations" hidden={active !== "chat"} role="tabpanel" id="maintenance-panel-chat" aria-labelledby="maintenance-tab-chat">
       <ChatSettings admin={admin} active={active === "chat"} />
     </div>
     <div className="operations" hidden={active !== "schedule"} role="tabpanel" id="maintenance-panel-schedule" aria-labelledby="maintenance-tab-schedule">
-      <Schedule jobActive={!!job} fetchReadmes={() => run("readmes", false)} confirm={id => run("sync", false, id)} />
+      <Schedule jobActive={running} fetchReadmes={() => run("readmes", false)} confirm={id => run("sync", false, id)} />
     </div>
   </>;
 }

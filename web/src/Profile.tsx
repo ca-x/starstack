@@ -10,7 +10,9 @@ import { Failure } from "./shared";
 export interface Profile { username: string; admin: boolean; nickname: string | null }
 
 function Avatar({ username, name }: { username: string; name: string }) {
-  const marks = Array.from(name).slice(0, 2).join("").toLocaleUpperCase();
+  const characters = Array.from(name);
+  const first = characters[0] ?? "";
+  const marks = /^\p{Script=Han}$/u.test(first) ? first : characters.slice(0, 2).join("").toLocaleUpperCase();
   const colors = ["#734b37", "#4e6457", "#53647e", "#77526c", "#785d39"];
   const hash = Array.from(username).reduce((value, char) => (value * 31 + char.codePointAt(0)!) >>> 0, 0);
   return <span className="profile-avatar" aria-hidden="true" style={{ backgroundColor: colors[hash % colors.length] }}>{marks}</span>;

@@ -1,4 +1,4 @@
-//! Instance-wide outbound proxy for GitHub and public README requests.
+//! Outbound proxy defaults and account overrides for GitHub and README requests.
 use crate::{
     auth,
     store::{self, Db},
@@ -11,6 +11,14 @@ use serde_json::{Value, json};
 use std::env;
 
 diesel::table! { proxy_configuration(id) { id -> Integer, setting -> Text, } }
+
+const ACCOUNT_PROXY: &str = "github_proxy";
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Scope {
+    Instance,
+    Account,
+}
 
 const INVALID_URL: &str = "代理地址无效，请填写 HTTP、HTTPS、SOCKS5 或 SOCKS5h 代理 URL";
 
@@ -119,51 +127,105 @@ fn effective(db: &mut Db, operator: Option<String>) -> Result<(ProxyConfig, &'st
     }
 }
 
+fn account_config(db: &mut Db) -> Result<Option<ProxyConfig>> {
+    Ok(match store::meta(db, ACCOUNT_PROXY)?.as_deref() {
+        None => None,
+        Some("system") => Some(ProxyConfig::System),
+        Some("direct") => Some(ProxyConfig::Direct),
+        Some(raw) => Some(ProxyConfig::custom(raw)?),
+    })
+}
+
+fn scoped_config(db: &mut Db, scope: Scope, operator: Option<String>) -> Result<ProxyConfig> {
+    if scope == Scope::Account
+        && operator.is_none()
+        && let Some(config) = account_config(db)?
+    {
+        return Ok(config);
+    }
+    Ok(effective(db, operator)?.0)
+}
+
 pub(crate) fn config(db: &mut Db) -> Result<ProxyConfig> {
-    Ok(effective(db, operator_url()?)?.0)
+    scoped_config(db, Scope::Account, operator_url()?)
+}
+
+pub(crate) fn instance_builder(db: &mut Db) -> Result<reqwest::blocking::ClientBuilder> {
+    scoped_config(db, Scope::Instance, operator_url()?)?.blocking_builder()
 }
 
 pub(crate) fn builder(db: &mut Db) -> Result<reqwest::blocking::ClientBuilder> {
     config(db)?.blocking_builder()
 }
 
-fn require_admin(db: &mut Db, revision: Option<i32>) -> Result<()> {
+fn require_access(db: &mut Db, revision: i32, scope: Scope) -> Result<()> {
     let owner = store::owner(db)?;
     let user = auth::account(db, &owner)?;
-    ensure!(user.admin && !user.disabled, "需要管理员权限");
     ensure!(
-        revision.is_none_or(|value| user.revision == value),
+        !user.disabled && user.revision == revision,
         "会话已失效，请重新登录"
     );
+    ensure!(scope == Scope::Account || user.admin, "需要管理员权限");
     Ok(())
 }
 
-pub(crate) fn read_settings(db: &mut Db) -> Result<Value> {
-    require_admin(db, None)?;
-    let (config, source) = effective(db, operator_url()?)?;
-    Ok(config.status(source))
+pub(crate) fn read_settings(db: &mut Db, revision: i32, scope: Scope) -> Result<Value> {
+    require_access(db, revision, scope)?;
+    settings(db, scope, operator_url()?)
+}
+
+fn settings(db: &mut Db, scope: Scope, operator: Option<String>) -> Result<Value> {
+    if scope == Scope::Instance {
+        let (config, source) = effective(db, operator)?;
+        return Ok(config.status(source));
+    }
+    if operator.is_some() {
+        return Ok(
+            json!({"mode":"inherit","source":"environment","address":null,"has_credentials":false}),
+        );
+    }
+    Ok(match account_config(db)? {
+        Some(config) => config.status("database"),
+        None => {
+            json!({"mode":"inherit","source":"instance","address":null,"has_credentials":false})
+        }
+    })
 }
 
 #[derive(Deserialize)]
 #[serde(rename_all = "lowercase", tag = "mode", deny_unknown_fields)]
 enum Update {
+    Inherit,
     System,
     Direct,
     Custom { url: String },
 }
 
-pub(crate) fn test_connection(db: &mut Db, input: Value, revision: i32) -> Result<Value> {
-    require_admin(db, Some(revision))?;
+fn selection(input: Value, scope: Scope) -> Result<Option<ProxyConfig>> {
+    let update: Update = serde_json::from_value(input).map_err(|_| anyhow!("代理设置格式无效"))?;
+    match update {
+        Update::Inherit if scope == Scope::Account => Ok(None),
+        Update::Inherit => bail!("实例代理不能继承个人代理"),
+        Update::System => Ok(Some(ProxyConfig::System)),
+        Update::Direct => Ok(Some(ProxyConfig::Direct)),
+        Update::Custom { url } => Ok(Some(ProxyConfig::custom(url.trim())?)),
+    }
+}
+
+pub(crate) fn test_connection(
+    db: &mut Db,
+    input: Value,
+    revision: i32,
+    scope: Scope,
+) -> Result<Value> {
+    require_access(db, revision, scope)?;
     let operator = operator_url()?;
     let config = if input.is_null() || operator.is_some() {
-        effective(db, operator)?.0
+        scoped_config(db, scope, operator)?
     } else {
-        let update: Update =
-            serde_json::from_value(input).map_err(|_| anyhow!("代理设置格式无效"))?;
-        match update {
-            Update::System => ProxyConfig::System,
-            Update::Direct => ProxyConfig::Direct,
-            Update::Custom { url } => ProxyConfig::custom(url.trim())?,
+        match selection(input, scope)? {
+            Some(config) => config,
+            None => effective(db, None)?.0,
         }
     };
     let start = std::time::Instant::now();
@@ -188,26 +250,41 @@ pub(crate) fn test_connection(db: &mut Db, input: Value, revision: i32) -> Resul
     Ok(json!({"elapsed_ms": start.elapsed().as_millis()}))
 }
 
-pub(crate) fn save_settings(db: &mut Db, input: Value, revision: i32) -> Result<Value> {
-    persist(db, input, revision, operator_url()?)
+pub(crate) fn save_settings(
+    db: &mut Db,
+    input: Value,
+    revision: i32,
+    scope: Scope,
+) -> Result<Value> {
+    persist(db, input, revision, operator_url()?, scope)
 }
 
-fn persist(db: &mut Db, input: Value, revision: i32, operator: Option<String>) -> Result<Value> {
-    let update: Update = serde_json::from_value(input).map_err(|_| anyhow!("代理设置格式无效"))?;
+fn persist(
+    db: &mut Db,
+    input: Value,
+    revision: i32,
+    operator: Option<String>,
+    scope: Scope,
+) -> Result<Value> {
+    let selected = selection(input, scope)?;
     db.immediate_transaction(|db| {
-        require_admin(db, Some(revision))?;
+        require_access(db, revision, scope)?;
         ensure!(operator.is_none(), "代理由 STARSTACK_PROXY_URL 管理");
-        schema(db)?;
-        let selected = match update {
-            Update::System => ProxyConfig::System,
-            Update::Direct => ProxyConfig::Direct,
-            Update::Custom { url } => ProxyConfig::custom(url.trim())?,
-        };
         let value = match &selected {
-            ProxyConfig::System => None,
-            ProxyConfig::Direct => Some("direct"),
-            ProxyConfig::Custom(url) => Some(url.as_str()),
+            None => None,
+            Some(ProxyConfig::System) if scope == Scope::Instance => None,
+            Some(ProxyConfig::System) => Some("system"),
+            Some(ProxyConfig::Direct) => Some("direct"),
+            Some(ProxyConfig::Custom(url)) => Some(url.as_str()),
         };
+        if scope == Scope::Account {
+            match value {
+                Some(value) => store::set_meta(db, ACCOUNT_PROXY, value)?,
+                None => store::delete_meta(db, ACCOUNT_PROXY)?,
+            }
+            return settings(db, scope, None);
+        }
+        schema(db)?;
         if let Some(value) = value {
             diesel::insert_into(proxy_configuration::table)
                 .values((
@@ -218,11 +295,10 @@ fn persist(db: &mut Db, input: Value, revision: i32, operator: Option<String>) -
                 .do_update()
                 .set(proxy_configuration::setting.eq(value))
                 .execute(db)?;
-            Ok(selected.status("database"))
         } else {
             diesel::delete(proxy_configuration::table.find(1)).execute(db)?;
-            Ok(selected.status("system"))
         }
+        settings(db, scope, None)
     })
 }
 

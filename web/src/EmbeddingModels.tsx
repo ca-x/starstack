@@ -1,5 +1,4 @@
 import { useEffect, useState, type FormEvent } from "react";
-import { createPortal } from "react-dom";
 import { EuiButton, EuiButtonGroup, EuiFieldText, EuiFormRow, EuiSelect, EuiTextArea } from "@elastic/eui";
 import { api, message } from "./api";
 import { read, t, write } from "./locale";
@@ -8,7 +7,10 @@ import { ModelSearch } from "./ModelSearch";
 import { ModelUpload, customFiles } from "./ModelUpload";
 import { ModelRow, statuses, type ModelFile } from "./ModelRow";
 import { Failure } from "./shared";
+import { IndexOverview } from "./IndexOverview";
 
+type IndexProfile = "quiet" | "balanced" | "performance";
+const profiles = { quiet: "轻量", balanced: "均衡", performance: "全速" } as const;
 type Backend = "builtin" | "ollama";
 interface Catalog {
   backend: Backend;
@@ -18,6 +20,8 @@ interface Catalog {
   ollama_urls: string[];
   needs_rebuild: boolean;
   index_issue?: string | null;
+  index_profile: IndexProfile;
+  index_threads: Record<IndexProfile, number>;
   chunking: Chunking;
   models: ModelFile[];
 }
@@ -30,8 +34,8 @@ function approvedUrl(raw: string) {
   } catch { return false; }
 }
 
-export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active, openMarket, openIndex, noticeTarget }: {
-  active: string; noticeTarget: HTMLDivElement | null; openMarket: () => void; openIndex: () => void; admin: boolean; jobActive: boolean; index: (rebuild: boolean) => Promise<void>; fallbackModel: string;
+export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active, openMarket, indexRunning }: {
+  active: string; indexRunning: boolean; openMarket: () => void; admin: boolean; jobActive: boolean; index: (rebuild: boolean) => Promise<void>; fallbackModel: string;
 }) {
   const [catalog, setCatalog] = useState<Catalog>();
   const [draft, setDraft] = useState<string>();
@@ -86,14 +90,14 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active
   const activeFile = catalog?.backend === "builtin" ? files.find(row => row.id === catalog.model) : undefined;
   const missingActiveFile = catalog?.backend === "builtin" && activeFile?.status !== "ready";
 
-  async function change(action: "select" | "endpoints" | "chunking", body: object) {
-    if (busy || (action !== "select" && action !== "chunking" && !admin)) return false;
-    setWriting(true); setActionError(""); setNotice(""); setChunkFeedback(action === "chunking");
+  async function change(action: "select" | "endpoints" | "chunking" | "index-profile", body: object) {
+    if (busy || (action === "endpoints" && !admin)) return false;
+    setWriting(true); setActionError(""); setNotice(""); setChunkFeedback(action === "chunking" || action === "index-profile");
     try {
       await api<{ message: string }>(`models/${action}`, body);
       if (action === "select") { setDraft(undefined); setDraftUrl(undefined); setDraftModel(undefined); }
       if (action === "endpoints") setServerList(undefined);
-      setNotice({ select: "已更新当前账号的模型。", chunking: "已保存分块设置。", endpoints: "已保存 Ollama 服务地址。" }[action]);
+      setNotice({ select: "已更新当前账号的模型。", chunking: "已保存分块设置。", endpoints: "已保存 Ollama 服务地址。", "index-profile": "索引挡位已保存。" }[action]);
       setRevision(n => n + 1);
       return true;
     } catch (e) { setActionError(message(e)); return false; } finally { setWriting(false); }
@@ -124,13 +128,14 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active
       : catalog?.needs_rebuild ? t("当前账号的索引需要重建。") : "";
   const viewMarket = missingActiveFile && admin;
   return <>
-    {modelIssue && noticeTarget && createPortal(<section className="job-notice job-notice--warning model-index-notice" aria-label={t("语义索引需要处理")}>
+    {modelIssue && active === "index" && <section className="job-notice job-notice--warning model-index-notice" aria-label={t("语义索引需要处理")}>
       <div role="status"><strong>{t("语义索引需要处理")}</strong><p>{modelIssue}</p></div>
-      {viewMarket ? <EuiButton size="s" onClick={openMarket}>{t("打开模型市场")}</EuiButton>
-        : active !== "index" && <EuiButton size="s" onClick={openIndex}>{t("查看索引设置")}</EuiButton>}
-    </section>, noticeTarget)}
+      {viewMarket && <EuiButton size="s" onClick={openMarket}>{t("打开模型市场")}</EuiButton>}
+    </section>}
     <div className="operations" hidden={active !== "index"} role="tabpanel" id="maintenance-panel-index" aria-labelledby="maintenance-tab-index">
-    <section className="operation"><div><h2>{t("语义索引")}</h2>
+    <IndexOverview visible={active === "index"} working={indexRunning} attention={!!modelIssue}
+      modelBytes={activeFile?.status === "ready" ? activeFile.downloaded_bytes : undefined} />
+    <section className="operation"><div><h2>{t("模型与索引设置")}</h2>
     <p>{t("为新增或变更的仓库建立索引。更换模型后可重建全部索引。")}</p></div>
     <dl className="inline-fact"><dt>{t("当前账号模型")}</dt><dd>{catalog
       ? `${catalog.backend === "ollama" ? "Ollama" : t("内置")} · ${catalog.model}` : fallbackModel || t("未配置")}</dd></dl>
@@ -155,6 +160,14 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active
         </>}
         <EuiButton type="submit" isDisabled={busy || jobActive || !available || !changed}>{t("使用此模型")}</EuiButton>
       </form>
+      {catalog.backend === "builtin" && catalog.index_threads && <EuiFormRow label={t("索引挡位")}
+        helpText={t("控制内置模型建索引时的 CPU 线程数，下次任务生效。")} fullWidth>
+        <EuiSelect fullWidth value={catalog.index_profile} disabled={busy || jobActive}
+          options={(Object.keys(profiles) as IndexProfile[]).map(value => ({
+            value, text: t("{0} · {1} CPU 线程", t(profiles[value]), catalog.index_threads[value]),
+          }))}
+          onChange={event => { void change("index-profile", { profile: event.target.value }); }} />
+      </EuiFormRow>}
       {catalog.chunking && <ChunkingSettings key={catalog.backend} current={catalog.chunking} backend={catalog.backend === "ollama" ? "Ollama" : t("内置")}
         disabled={busy || jobActive} save={settings => change("chunking", settings)} />}
       {chunkFeedback && feedback}
