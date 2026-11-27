@@ -102,7 +102,12 @@ type Shared = Arc<App>;
 struct ApiError(StatusCode, String);
 impl From<anyhow::Error> for ApiError {
     fn from(e: anyhow::Error) -> Self {
-        Self(StatusCode::BAD_REQUEST, format!("{e:#}"))
+        let status = if e.is::<library::SemanticContinuationUnavailable>() {
+            StatusCode::SERVICE_UNAVAILABLE
+        } else {
+            StatusCode::BAD_REQUEST
+        };
+        Self(status, format!("{e:#}"))
     }
 }
 impl IntoResponse for ApiError {
@@ -675,18 +680,31 @@ async fn write(
                 Ok(json!({"total":total, "repositories":library::cards(page)}))
             }).await?
         }
-        "search" | "ask" => {
+        "search" => {
+            #[derive(Deserialize)]
+            struct SearchPageRequest {
+                #[serde(default)]
+                seen: Vec<i64>,
+                continuation_mode: Option<library::ContinuationMode>,
+                #[serde(flatten)]
+                query: Query,
+            }
+            let mut input: SearchPageRequest = value(body)?;
+            let page = lib.run(move |db| {
+                input.query.filter.exclude_seen(input.seen)?;
+                library::search_page(db, &input.query, input.continuation_mode)
+            }).await?;
+            json!({"repositories":library::cards(page.repositories),"answer":null,"answer_error":null,"keyword_fallback":page.keyword_fallback,"has_more":page.has_more})
+        }
+        "ask" => {
             let mut q: Query = value(body)?;
-            let ask = path == "ask";
-            if ask { q.limit=Some(5); }
+            q.limit=Some(5);
             let question = q.query.clone();
             let (rows, keyword) = lib.run(move|db| library::interactive_search(db,&q)).await?;
-            let (answer, answer_error) = if ask {
-                match ai::ask(&question,&rows).await {
+            let (answer, answer_error) = match ai::ask(&question,&rows).await {
                     Ok(answer) => (Some(answer), None),
                     Err(error) => (None, Some(error.to_string())),
-                }
-            } else { (None, None) };
+            };
             json!({"repositories":library::cards(rows),"answer":answer,"answer_error":answer_error,"keyword_fallback":keyword})
         }
         "edit" => {

@@ -1,6 +1,11 @@
 import type { EuiThemeModifications } from "@elastic/eui";
 
 export const consoleTheme: EuiThemeModifications = {
+  font: {
+    family: "var(--serif)",
+    familySerif: "var(--serif)",
+    familyCode: "var(--mono)",
+  },
   animation: {
     fast: "150ms",
     normal: "220ms",

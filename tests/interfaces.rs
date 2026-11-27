@@ -125,6 +125,99 @@ fn http_accounts_confirmation_and_revocation() -> Result<()> {
     )?
     .error_for_status()?;
     let reader = login("reader", "fixture-reader-123")?;
+    {
+        use diesel::{
+            Connection, RunQueryDsl, SqliteConnection,
+            sql_types::{BigInt, Text},
+        };
+        let database = dir.path().join("starstack.sqlite3");
+        let mut db = SqliteConnection::establish(database.to_str().unwrap())?;
+        for id in [1_i64, 2, 3] {
+            let metadata = json!({"id":id, "full_name":format!("sample/repo{id}"),
+                "description":"pagination fixture","language":"Rust","topics":[],
+                "stargazers_count":1,"starred_at":"2025-01-01","html_url":"https://github.com/sample",
+                "archived":false});
+            diesel::sql_query(
+                "INSERT INTO repositories(owner_id,id,metadata) VALUES ('primary',?,?)",
+            )
+            .bind::<BigInt, _>(id)
+            .bind::<Text, _>(metadata.to_string())
+            .execute(&mut db)?;
+        }
+    }
+    let first: Value = post("search", &admin, json!({"query":"pagination","limit":2}))?
+        .error_for_status()?
+        .json()?;
+    assert_eq!(first.get("answer"), Some(&Value::Null));
+    assert_eq!(first.get("answer_error"), Some(&Value::Null));
+    assert_eq!(first["has_more"], true);
+    assert_eq!(first["keyword_fallback"], true);
+    let shown: Vec<_> = first["repositories"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["id"].as_i64().unwrap())
+        .collect();
+    assert_eq!(shown, [1, 2]);
+    let second: Value = post(
+        "search",
+        &admin,
+        json!({"query":"pagination","seen":shown,"limit":2,"continuation_mode":"keyword"}),
+    )?
+    .error_for_status()?
+    .json()?;
+    assert_eq!(second["has_more"], false);
+    assert_eq!(second["repositories"].as_array().unwrap().len(), 1);
+    assert_eq!(second["repositories"][0]["id"], 3);
+    let other: Value = post(
+        "search",
+        &reader,
+        json!({"query":"pagination","seen":[1],"limit":2}),
+    )?
+    .error_for_status()?
+    .json()?;
+    assert_eq!(other["repositories"], json!([]));
+    assert_eq!(
+        post(
+            "search",
+            &reader,
+            json!({"query":"x","continuation_mode":"semantic"})
+        )?
+        .status(),
+        503
+    );
+    assert_eq!(
+        post(
+            "search",
+            &reader,
+            json!({"query":"x","continuation_mode":"unknown"})
+        )?
+        .status(),
+        400
+    );
+    for invalid in [0, 101] {
+        assert_eq!(
+            post(
+                "search",
+                &reader,
+                json!({"query":"x","limit":invalid,"continuation_mode":"semantic"})
+            )?
+            .status(),
+            400
+        );
+    }
+    for invalid in [json!([-1]), json!(["1"]), json!([u64::MAX])] {
+        assert_eq!(
+            post(
+                "search",
+                &admin,
+                json!({"query":"pagination","seen":invalid})
+            )?
+            .status(),
+            400
+        );
+    }
+
     assert_eq!(
         post(
             "users",

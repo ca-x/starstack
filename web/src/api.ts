@@ -48,6 +48,9 @@ export async function request(path: string, body?: object, signal?: AbortSignal)
   });
   if (!response.ok) {
     if (response.status === 401 && location.pathname !== "/login") location.replace("/login");
+    if (response.status === 503 && path === "search" && getLocale() === "en") {
+      throw new Error(t("语义检索暂不可用，请重试加载更多"));
+    }
     const failure = await response.json().catch(() => ({}));
     throw new Error(failure.error ? t(failure.error) : t("请求失败（HTTP {0}）", response.status));
   }

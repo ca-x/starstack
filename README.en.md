@@ -125,7 +125,9 @@ Replace `Dev tools` with an existing list name. The MCP tool `search_stars` acce
 
 ## Organize and export
 
-Click a tag in the **Local tag cloud** on the statistics page to browse its repositories. In the library, **Organize with AI** can preview one batch or, after confirmation, process all matching repositories in the background. Choose local private tags or existing GitHub lists. Updating GitHub lists requires write access. If you filter by tag, run the filter again after applying changes to refresh the results.
+Natural-language search shows 25 repositories initially. Choose a batch size of 10, 25, 50, or 100, then select **Load more** below the results to see more matches with the same filters. Existing cards stay in place when you load another batch or retry. Keyword fallback also supports loading more results.
+
+The tag clouds in the library and on the statistics page give each tag a consistent color. Type size reflects its repository count. Select a tag to browse those repositories. In the library, **Organize with AI** can preview one batch or, after confirmation, process all matching repositories in the background. Choose local private tags or existing GitHub lists. Updating GitHub lists requires write access. If you filter by tag, run the filter again after applying changes to refresh the results.
 
 AI organization and recommendations use a separate chat model. An administrator must configure Aimux in the dashboard or explicitly set the environment variables below before the first request. For Ollama, run `ollama pull qwen3:4b` on the chat server and replace the example URL with an address StarStack can reach.
 

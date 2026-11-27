@@ -150,6 +150,10 @@ pub(crate) struct Repo {
 
 #[derive(Debug, Default, Clone, PartialEq, clap::Args, Deserialize, schemars::JsonSchema)]
 pub(crate) struct Filter {
+    /// Pre-encoded ID array for the SQLite exclusion predicate on subsequent search pages.
+    #[arg(skip)]
+    #[serde(skip)]
+    pub seen_json: Option<String>,
     /// Primary programming language, e.g. Rust
     #[arg(long)]
     pub language: Option<String>,
@@ -176,6 +180,16 @@ pub(crate) struct Filter {
     pub until: Option<NaiveDate>,
 }
 impl Filter {
+    pub fn exclude_seen(&mut self, mut ids: Vec<i64>) -> Result<()> {
+        ensure!(ids.iter().all(|&id| id >= 0), "已展示的仓库 ID 不能为负数");
+        ids.sort_unstable();
+        ids.dedup();
+        self.seen_json = (!ids.is_empty())
+            .then(|| serde_json::to_string(&ids))
+            .transpose()?;
+        Ok(())
+    }
+
     pub fn validate(&self) -> Result<()> {
         ensure!(
             !matches!((self.since,self.until),(Some(a),Some(b)) if a>b),
@@ -450,6 +464,13 @@ pub(crate) fn eligible<'a>(
     let mut q = r::table
         .filter(r::owner_id.eq(owner).and(r::active.eq(true)))
         .into_boxed();
+    if let Some(ids) = &filter.seen_json {
+        q = q.filter(
+            sql::<Bool>("repositories.id NOT IN (SELECT value FROM json_each(")
+                .bind::<Text, _>(ids)
+                .sql("))"),
+        );
+    }
     if let Some(name) = &filter.list {
         q = q.filter(
             sql::<Bool>(

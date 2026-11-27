@@ -1,5 +1,5 @@
 import { languageName, t } from "./locale";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState, type FormEvent, type MouseEvent } from "react";
 import { EuiButton, EuiButtonEmpty, EuiFieldText, EuiSelect } from "@elastic/eui";
 import { api, date, message, request, type Filters, type Repo, type Sort, type Stats } from "./api";
 import { TagCloud } from "./TagCloud";
@@ -50,6 +50,12 @@ export function Library({ stats, initial, revision, onEdit, onSync, tagLink }: {
   const [pageSize, setPageSize] = useState(25);
   const [showFilters, setShowFilters] = useState(false);
   const [repos, setRepos] = useState<Repo[]>([]);
+  const [hasMore, setHasMore] = useState(false);
+  const [loadingMore, setLoadingMore] = useState(false);
+  const [moreError, setMoreError] = useState("");
+  const moreRequest = useRef<AbortController | null>(null);
+  const resultsRef = useRef<HTMLUListElement>(null);
+  const focusNewRow = useRef<number | null>(null);
   const [total, setTotal] = useState(0);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState("");
@@ -63,12 +69,16 @@ export function Library({ stats, initial, revision, onEdit, onSync, tagLink }: {
   useEffect(() => {
     const controller = new AbortController();
     setLoading(true);
+    setHasMore(false);
+    setLoadingMore(false);
+    setMoreError("");
+    focusNewRow.current = null;
     setError("");
     setAnswer("");
     setAnswerError("");
     setKeyword(false);
     const body = query ? { ...filters, query, ...(mode === "search" && { limit: pageSize }) } : { ...filters, sort, limit: pageSize, offset: page * pageSize };
-    api<{ repositories: Repo[]; total?: number; answer?: string; answer_error?: string; keyword_fallback?: boolean }>(query ? mode : "list", body, controller.signal)
+    api<{ repositories: Repo[]; total?: number; has_more?: boolean; answer?: string; answer_error?: string; keyword_fallback?: boolean }>(query ? mode : "list", body, controller.signal)
       .then(data => {
         if (controller.signal.aborted) return;
         const count = data.total ?? data.repositories.length;
@@ -80,12 +90,52 @@ export function Library({ stats, initial, revision, onEdit, onSync, tagLink }: {
         setAnswerError(data.answer_error || "");
         setKeyword(data.keyword_fallback === true);
         setRepos(data.repositories);
+        setHasMore(data.has_more === true);
         setTotal(count);
       })
       .catch(e => { if (!controller.signal.aborted) setError(message(e)); })
       .finally(() => { if (!controller.signal.aborted) setLoading(false); });
-    return () => controller.abort();
+    return () => {
+      controller.abort();
+      moreRequest.current?.abort();
+      moreRequest.current = null;
+    };
   }, [filters, sort, page, pageSize, query, mode, revision, retry]);
+
+  useEffect(() => {
+    const index = focusNewRow.current;
+    if (index !== null) {
+      resultsRef.current?.children[index]?.querySelector<HTMLButtonElement>(".repo-title")?.focus();
+      focusNewRow.current = null;
+    }
+  }, [repos]);
+
+  async function loadMore(keyboard: boolean) {
+    if (moreRequest.current || !hasMore || loading) return;
+    const controller = new AbortController();
+    moreRequest.current = controller;
+    setLoadingMore(true);
+    setMoreError("");
+    try {
+      const data = await api<{ repositories: Repo[]; has_more: boolean; keyword_fallback: boolean }>(
+        "search", {
+          ...filters, query, limit: pageSize, seen: repos.map(repo => repo.id),
+          continuation_mode: keyword ? "keyword" : "semantic",
+        }, controller.signal);
+      if (controller.signal.aborted) return;
+      if (keyboard && data.repositories.length) focusNewRow.current = repos.length;
+      setRepos(current => [...current, ...data.repositories]);
+      setHasMore(data.has_more);
+      setKeyword(data.keyword_fallback);
+    } catch (e) {
+      if (!controller.signal.aborted) setMoreError(message(e));
+    } finally {
+      if (!controller.signal.aborted) {
+        moreRequest.current = null;
+        setLoadingMore(false);
+      }
+    }
+  }
 
   function search(e: FormEvent) {
     e.preventDefault();
@@ -148,21 +198,29 @@ export function Library({ stats, initial, revision, onEdit, onSync, tagLink }: {
     {answer && <section className="ai-answer"><h2>{t("推荐结果")}</h2><p>{answer}</p></section>}
     <section className="collection" aria-labelledby="results-heading">
       <div className="result-head"><h2 id="results-heading">{query ? (mode === "ask" ? t("引用仓库") : t("相关仓库")) : t("仓库列表")}
-        {!loading && !error && <span className="count">{total.toLocaleString()}</span>}</h2>
+        {!loading && !error && <span className="count">{(query ? repos.length : total).toLocaleString()}</span>}</h2>
         <div className="row-controls">
           {!query && <EuiSelect compressed aria-label={t("排序")} value={sort} onChange={e => { setSort(e.target.value as Sort); setPage(0); }}
             options={[{ value: "time", text: t("按收藏时间") }, { value: "stars", text: t("按 Star 数") }]} />}
-          {!(query && mode === "ask") && <EuiSelect compressed aria-label={query ? t("最多返回条数") : t("每页条数")} value={pageSize} onChange={e => { setPageSize(Number(e.target.value)); setPage(0); }}
-            options={[10, 25, 50, 100].map(n => ({ value: n, text: query ? t("前 {0} 条", n) : t("{0} 条 / 页", n) }))} />}
+          {!(query && mode === "ask") && <EuiSelect compressed aria-label={query ? t("每次加载条数") : t("每页条数")} value={pageSize} onChange={e => { setPageSize(Number(e.target.value)); setPage(0); }}
+            options={[10, 25, 50, 100].map(n => ({ value: n, text: query ? t("每次 {0} 条", n) : t("{0} 条 / 页", n) }))} />}
         </div>
       </div>
       {error ? <Failure error={error} retry={() => setRetry(i => i + 1)} /> : loading ?
         <div className="empty" role="status">{query ? t("正在检索收藏…") : t("正在读取仓库…")}</div> : repos.length ?
-        <ul className="repo-list">{repos.map((repo, index) => <RepoRow key={repo.id} repo={repo} source={query && mode === "ask" ? index + 1 : undefined} open={() => setSelected(repo)} />)}</ul> :
+        <ul ref={resultsRef} className="repo-list">{repos.map((repo, index) => <RepoRow key={repo.id} repo={repo} source={query && mode === "ask" ? index + 1 : undefined} open={() => setSelected(repo)} />)}</ul> :
         <div className="empty"><span className="empty-star" aria-hidden="true">✦</span><h3>{emptyLibrary ? t("还没有收藏") : t("没有找到仓库")}</h3>
           <p>{emptyLibrary ? t("从 GitHub 同步 Stars，建立你的仓库收藏。") : t("可以调整筛选条件或换一种描述再试。")}</p>
           {emptyLibrary && <EuiButton size="s" onClick={onSync}>{t("前往同步")}</EuiButton>}
         </div>}
+      {query && mode === "search" && !loading && !error && repos.length > 0 && <div className="pagination">
+        <span role="status">{t("已显示 {0} 个仓库", repos.length.toLocaleString())}</span>
+        {hasMore && <EuiButtonEmpty size="s" isLoading={loadingMore} isDisabled={loadingMore}
+          onClick={(event: MouseEvent<HTMLButtonElement>) => void loadMore(event.detail === 0)}>
+          {t(loadingMore ? "正在加载…" : moreError ? "重试" : "加载更多")}
+        </EuiButtonEmpty>}
+        {moreError && <Failure error={moreError} />}
+      </div>}
       {!query && !error && !loading && total > pageSize && <nav className="pagination" aria-label={t("分页")}>
         <EuiButtonEmpty onClick={() => setPage(page - 1)} isDisabled={page === 0} iconType="arrowLeft">{t("上一页")}</EuiButtonEmpty>
         <span>{t("第 {0} / {1} 页", page + 1, Math.ceil(total / pageSize))}</span>

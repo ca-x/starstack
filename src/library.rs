@@ -72,17 +72,76 @@ pub(crate) fn search_published(db: &mut Db, q: &Query) -> Result<Vec<Repo>> {
 
 pub(crate) fn interactive_search(db: &mut Db, q: &Query) -> Result<(Vec<Repo>, bool)> {
     q.validate()?;
+    interactive_results(db, q, q.limit.unwrap_or(10), None)
+}
+
+#[derive(Clone, Copy, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub(crate) enum ContinuationMode {
+    Keyword,
+    Semantic,
+}
+
+#[derive(Debug)]
+pub(crate) struct SemanticContinuationUnavailable;
+
+impl std::fmt::Display for SemanticContinuationUnavailable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("语义检索暂不可用，请重试加载更多")
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct SearchPage {
+    pub repositories: Vec<Repo>,
+    pub keyword_fallback: bool,
+    pub has_more: bool,
+}
+
+pub(crate) fn search_page(
+    db: &mut Db,
+    q: &Query,
+    mode: Option<ContinuationMode>,
+) -> Result<SearchPage> {
+    q.validate()?;
     let limit = q.limit.unwrap_or(10);
-    if index::has_published_generation(db).unwrap_or(false)
-        && let Ok(rows) = index::hybrid_search(
+    let (mut rows, keyword) = interactive_results(db, q, limit + 1, mode)?;
+    let has_more = rows.len() > limit;
+    rows.truncate(limit);
+    Ok(SearchPage {
+        repositories: rows,
+        keyword_fallback: keyword,
+        has_more,
+    })
+}
+
+fn interactive_results(
+    db: &mut Db,
+    q: &Query,
+    limit: usize,
+    mode: Option<ContinuationMode>,
+) -> Result<(Vec<Repo>, bool)> {
+    let semantic = |db: &mut Db| -> Result<Vec<Repo>> {
+        ensure!(index::has_published_generation(db)?, "尚未建立语义索引");
+        index::hybrid_search(
             db,
             &q.query,
             &q.filter,
             limit,
             std::time::Duration::from_secs(10),
         )
-    {
-        return Ok((rows, false));
+    };
+    match mode {
+        Some(ContinuationMode::Semantic) => {
+            let rows = semantic(db).context(SemanticContinuationUnavailable)?;
+            return Ok((rows, false));
+        }
+        Some(ContinuationMode::Keyword) => {}
+        None => {
+            if let Ok(rows) = semantic(db) {
+                return Ok((rows, false));
+            }
+        }
     }
     let filter = index::inferred_filter(&q.query, &q.filter, chrono::Utc::now().date_naive());
     Ok((store::keyword_search(db, &q.query, &filter, limit)?, true))

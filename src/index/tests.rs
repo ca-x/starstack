@@ -1111,3 +1111,90 @@ fn remote_embeddings_keep_order_across_requests_and_sum_token_usage() -> Result<
     assert_eq!(progress.tokens, Some(12));
     Ok(())
 }
+
+#[test]
+fn appended_search_pages_apply_seen_and_filters_to_both_rankings_and_fallback() -> Result<()> {
+    let home = tempfile::tempdir()?;
+    let mut db = store::connect(home.path())?;
+    let mut other = store::connect_as(home.path(), "other")?;
+    store::upsert(&mut other, &repo(77, 2025, "needle", "Rust"))?;
+    let large = 9_007_199_254_740_993_i64;
+    for (id, description, language) in [
+        (1, "needle", "Rust"),
+        (2, "needle", "Rust"),
+        (3, "other text", "Rust"),
+        (4, "needle", "Go"),
+        (large, "needle", "Rust"),
+    ] {
+        store::upsert(&mut db, &repo(id, 2025, description, language))?;
+    }
+    let mut q = crate::library::Query {
+        query: "needle".into(),
+        limit: Some(2),
+        filter: Filter {
+            language: Some("Rust".into()),
+            ..Filter::default()
+        },
+    };
+    let ids = |rows: &[Repo]| rows.iter().map(|r| r.id).collect::<Vec<_>>();
+    let first = crate::library::search_page(&mut db, &q, None)?;
+    assert!(first.keyword_fallback && first.has_more);
+    assert_eq!(ids(&first.repositories), [1, 2]);
+    // The first keyword page must also be excluded after a semantic index becomes available.
+    let offline = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let unavailable = offline.clone();
+    let calls = Arc::new(AtomicUsize::new(0));
+    let received = calls.clone();
+    let server = Server::new(move |request| {
+        received.fetch_add(1, Ordering::SeqCst);
+        if unavailable.load(Ordering::SeqCst) {
+            return Reply::status(503);
+        }
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        Reply::json(json!({"embeddings":vec![[1.0,0.0];body["input"].as_array().unwrap().len()]}))
+    });
+    crate::ollama_settings::set_endpoints(&mut db, std::slice::from_ref(&server.url))?;
+    crate::ollama_settings::set(&mut db, Some(&server.url), Some("fixture"))?;
+    set_backend(&mut db, "ollama")?;
+    build(&mut db, false, &|_| {})?;
+    let ranked = crate::library::search_page(&mut db, &q, None)?;
+    assert!(!ranked.keyword_fallback && ranked.has_more);
+    assert_eq!(ids(&ranked.repositories), ids(&first.repositories));
+    q.filter.exclude_seen(ids(&first.repositories))?;
+    use crate::library::ContinuationMode::{Keyword, Semantic};
+    let before = calls.load(Ordering::SeqCst);
+    let keyword_page = crate::library::search_page(&mut db, &q, Some(Keyword))?;
+    assert!(keyword_page.keyword_fallback && !keyword_page.has_more);
+    assert_eq!(ids(&keyword_page.repositories), [large]);
+    assert_eq!(calls.load(Ordering::SeqCst), before);
+    let next = crate::library::search_page(&mut db, &q, None)?;
+    assert!(!next.keyword_fallback && !next.has_more);
+    let mut remaining = ids(&next.repositories);
+    remaining.sort_unstable();
+    assert_eq!(remaining, [3, large]);
+    q.filter.exclude_seen(vec![1, 2, large])?;
+    offline.store(true, Ordering::SeqCst);
+    let error = crate::library::search_page(&mut db, &q, Some(Semantic)).unwrap_err();
+    assert!(error.is::<crate::library::SemanticContinuationUnavailable>());
+    offline.store(false, Ordering::SeqCst);
+    let retry = crate::library::search_page(&mut db, &q, Some(Semantic))?;
+    assert!(!retry.keyword_fallback && !retry.has_more);
+    assert_eq!(ids(&retry.repositories), [3]);
+    // A source edit triggers live keyword fallback. Thousands of exact i64 exclusions
+    // use one SQL binding. Duplicates and unknown IDs leave the remaining match intact.
+    store::edit(
+        &mut db,
+        store::Edit {
+            id: 2,
+            note: Some("changed".into()),
+            ..Default::default()
+        },
+    )?;
+    let mut shown: Vec<_> = (10..3010).collect();
+    shown.extend([1, large, large]);
+    q.filter.exclude_seen(shown)?;
+    let after_edit = crate::library::search_page(&mut db, &q, None)?;
+    assert!(after_edit.keyword_fallback && !after_edit.has_more);
+    assert_eq!(ids(&after_edit.repositories), [2]);
+    Ok(())
+}
