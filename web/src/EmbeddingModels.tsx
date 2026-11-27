@@ -16,6 +16,7 @@ interface Catalog {
   ollama_url: string;
   ollama_urls: string[];
   needs_rebuild: boolean;
+  index_issue?: string | null;
   chunking: Chunking;
   models: ModelFile[];
 }
@@ -28,8 +29,8 @@ function approvedUrl(raw: string) {
   } catch { return false; }
 }
 
-export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active, openMarket }: {
-  active: string; openMarket: () => void; admin: boolean; jobActive: boolean; index: (rebuild: boolean) => Promise<void>; fallbackModel: string;
+export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active, openMarket, openIndex }: {
+  active: string; openMarket: () => void; openIndex: () => void; admin: boolean; jobActive: boolean; index: (rebuild: boolean) => Promise<void>; fallbackModel: string;
 }) {
   const [catalog, setCatalog] = useState<Catalog>();
   const [draft, setDraft] = useState<string>();
@@ -115,7 +116,18 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active
     write("starstack.modelSource", value);
   }
 
+  const modelIssue = missingActiveFile
+    ? (admin ? t("请在模型市场安装当前模型，或切换到可用模型。安装后点击更新索引。")
+      : t("当前内置模型尚未就绪。请联系管理员下载，或切换到可用模型。"))
+    : catalog?.index_issue ? t(catalog.index_issue)
+      : catalog?.needs_rebuild ? t("当前账号的索引需要重建。") : "";
+  const viewMarket = missingActiveFile && admin;
   return <>
+    {modelIssue && <section className="job-notice job-notice--warning model-index-notice" aria-label={t("语义索引需要处理")}>
+      <div role="status"><strong>{t("语义索引需要处理")}</strong><p>{modelIssue}</p></div>
+      {viewMarket ? <EuiButton size="s" onClick={openMarket}>{t("打开模型市场")}</EuiButton>
+        : active !== "index" && <EuiButton size="s" onClick={openIndex}>{t("查看索引设置")}</EuiButton>}
+    </section>}
     <div className="operations" hidden={active !== "index"} role="tabpanel" id="maintenance-panel-index" aria-labelledby="maintenance-tab-index">
     <section className="operation"><div><h2>{t("语义索引")}</h2>
     <p>{t("为新增或变更的仓库建立索引。更换模型后可重建全部索引。")}</p></div>
@@ -142,11 +154,9 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active
         </>}
         <EuiButton type="submit" isDisabled={busy || jobActive || !available || !changed}>{t("使用此模型")}</EuiButton>
       </form>
-      {missingActiveFile && <p>{admin ? t("当前模型就绪后即可建立索引。") : t("当前内置模型尚未就绪。请联系管理员下载，或切换到可用模型。")}</p>}
       {catalog.chunking && <ChunkingSettings key={catalog.backend} current={catalog.chunking} backend={catalog.backend === "ollama" ? "Ollama" : t("内置")}
         disabled={busy || jobActive} save={settings => change("chunking", settings)} />}
       {chunkFeedback && feedback}
-      {catalog.needs_rebuild && <p className="index-hint">{t("当前账号的索引需要重建。")}</p>}
     </>}
     <div className="row-controls">
       <EuiButton isDisabled={jobActive || busy || missingActiveFile || catalog?.needs_rebuild} onClick={() => updateIndex(false)}>{t("更新索引")}</EuiButton>

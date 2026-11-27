@@ -19,7 +19,8 @@ pub(crate) fn select(db: &mut Db, input: Selection) -> Result<()> {
     match input.backend.as_str() {
         "ollama" => db.immediate_transaction(|db| {
             ollama_settings::set(db, input.url.as_deref(), input.model.as_deref())?;
-            index::set_backend(db, "ollama")
+            index::set_backend(db, "ollama")?;
+            store::delete_meta(db, "index_issue")
         }),
         "builtin" => {
             ensure!(input.url.is_none(), "内置模型使用本机文件");
@@ -31,7 +32,11 @@ pub(crate) fn select(db: &mut Db, input: Selection) -> Result<()> {
 
 pub(crate) fn panel(db: &mut Db) -> Result<Value> {
     let items = models::list(&store::data_dir(db)?)?;
-    let (url, model) = ollama_settings::selected(db)?;
+    let endpoints = ollama_settings::endpoints(db)?;
+    let url = store::meta(db, "ollama_url")?
+        .or_else(|| endpoints.first().cloned())
+        .unwrap_or_default();
+    let model = ollama_settings::configured_model(db)?;
     let models = items
         .into_iter()
         .map(|item| {
@@ -48,9 +53,14 @@ pub(crate) fn panel(db: &mut Db) -> Result<Value> {
         })
         .collect::<Vec<_>>();
     let backend = index::backend(db)?;
+    let (needs_rebuild, config_issue) = match index::needs_rebuild(db) {
+        Ok(rebuild) => (rebuild, None),
+        Err(error) => (false, Some(error.to_string())),
+    };
+    let index_issue = config_issue.or(store::meta(db, "index_issue")?);
     Ok(
         json!({"backend":backend,"chunking":crate::chunking::parameters(db,&backend)?,"model":index::configured_model(db)?,
-        "ollama_url":url,"ollama_model":model,"ollama_urls":ollama_settings::endpoints(db)?,
-        "needs_rebuild":index::needs_rebuild(db)?,"models":models}),
+        "ollama_url":url,"ollama_model":model,"ollama_urls":endpoints,
+        "index_issue":index_issue,"needs_rebuild":needs_rebuild,"models":models}),
     )
 }

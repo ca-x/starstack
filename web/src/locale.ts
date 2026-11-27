@@ -20,6 +20,18 @@ export function getAppearance(): Appearance {
 }
 
 const english: Record<string, string> = {
+  "正在检查索引模型和待处理仓库": "Checking the embedding model and repository changes",
+  "正在计算仓库向量": "Computing repository embeddings",
+  "仓库向量计算进度": "Repository embedding progress",
+  "新计算仓库": "New embeddings",
+  "复用仓库": "Reused embeddings",
+  "已处理文本块": "Text chunks processed",
+  "已处理 token": "Tokens processed",
+  "服务未报告": "Not reported by provider",
+  "计算用时（秒）": "Compute time (seconds)",
+  "语义索引需要处理": "Semantic index needs attention",
+  "查看索引设置": "View index settings",
+  "请在模型市场安装当前模型，或切换到可用模型。安装后点击更新索引。": "Install the active model from the model market or switch to a ready model. After installing, select Update index.",
   "正在暂停…": "Pausing…",
   "请先同步 GitHub 已有分类": "Sync your existing GitHub lists first.",
   "没有可继续的任务": "There is no job to resume.",

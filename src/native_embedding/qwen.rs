@@ -153,7 +153,11 @@ impl Encoder {
         })
     }
 
-    pub(super) fn embed(&self, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    pub(super) fn embed(
+        &self,
+        texts: &[&str],
+        observed: &mut dyn FnMut(usize),
+    ) -> Result<Vec<Vec<f32>>> {
         texts
             .iter()
             .map(|text| {
@@ -182,6 +186,7 @@ impl Encoder {
                         .reshape(WIDTH)?
                         .to_vec1::<f32>()?;
                     mean.push(&last)?;
+                    observed(ids.len());
                 }
                 mean.finish()
             })
@@ -200,14 +205,20 @@ mod tests {
                 .context("missing STARSTACK_TEST_QWEN_DIR")?,
         );
         let encoder = Encoder::load(&path)?;
-        let docs = encoder.embed(&[
-            "Find duplicate photos in a local image collection.",
-            "Profile process CPU and memory bottlenecks.",
-        ])?;
-        let queries = encoder.embed(&[
-            "Instruct: Retrieve matching GitHub repositories.\nQuery: 清理相册中重复照片",
-            "Instruct: Retrieve matching GitHub repositories.\nQuery: 进程内存与 CPU 性能瓶颈",
-        ])?;
+        let docs = encoder.embed(
+            &[
+                "Find duplicate photos in a local image collection.",
+                "Profile process CPU and memory bottlenecks.",
+            ],
+            &mut |_| {},
+        )?;
+        let queries = encoder.embed(
+            &[
+                "Instruct: Retrieve matching GitHub repositories.\nQuery: 清理相册中重复照片",
+                "Instruct: Retrieve matching GitHub repositories.\nQuery: 进程内存与 CPU 性能瓶颈",
+            ],
+            &mut |_| {},
+        )?;
         for (idx, q) in queries.iter().enumerate() {
             let dot = |d: &[f32]| q.iter().zip(d).map(|(a, b)| a * b).sum::<f32>();
             assert_eq!(q.len(), WIDTH);

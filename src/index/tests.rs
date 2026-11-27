@@ -31,6 +31,76 @@ fn repo(id: i64, year: i32, description: &str, language: &str) -> Repo {
 }
 
 #[test]
+fn index_progress_reports_new_and_reused_embeddings() -> Result<()> {
+    let temp = tempfile::tempdir()?;
+    let mut db = store::connect(temp.path())?;
+    let year = Utc::now().year();
+    let first = repo(101, year, "first", "Rust");
+    let mut second = repo(202, year, "second", "Rust");
+    store::upsert(&mut db, &first)?;
+
+    let server = Server::new(move |request| {
+        let body: Value = serde_json::from_slice(&request.body).unwrap();
+        let input = body["input"].as_array().unwrap();
+        let mut response = json!({"embeddings": vec![vec![1.0, 0.0, 0.0, 0.0]; input.len()]});
+        if !input
+            .iter()
+            .any(|text| text.as_str().unwrap().contains("no token count"))
+        {
+            response["prompt_eval_count"] = json!(input.len() * 17);
+        }
+        Reply::json(response)
+    });
+    let engine = Engine::fixture(&server.url, DEFAULT_MODEL)?;
+    let observe_build = |db: &mut Db| -> Result<Progress> {
+        let last = std::cell::Cell::new(None);
+        build_observed_with(db, temp.path(), false, &engine, &|_| {}, &|counts| {
+            last.set(Some(counts))
+        })?;
+        last.get().context("missing index progress")
+    };
+
+    let initial = observe_build(&mut db)?;
+    assert_eq!(
+        (
+            initial.repositories,
+            initial.total,
+            initial.reused,
+            initial.chunks,
+            initial.tokens
+        ),
+        (1, 1, 0, 1, Some(17))
+    );
+    let noop = observe_build(&mut db)?;
+    assert_eq!(
+        (
+            noop.repositories,
+            noop.total,
+            noop.reused,
+            noop.chunks,
+            noop.tokens
+        ),
+        (0, 0, 1, 0, Some(0))
+    );
+    second.description = Some("no token count".into());
+    store::upsert(&mut db, &second)?;
+    store::set_meta(&mut db, "index_pending", "1")?;
+    let partial = observe_build(&mut db)?;
+    assert_eq!(
+        (
+            partial.repositories,
+            partial.total,
+            partial.reused,
+            partial.chunks,
+            partial.tokens
+        ),
+        (1, 1, 1, 1, None)
+    );
+    assert!(store::meta(&mut db, "index_pending")?.is_none());
+    Ok(())
+}
+
+#[test]
 fn incremental_projection_recovers_and_filters_before_ranking() -> Result<()> {
     let temp = tempfile::tempdir()?;
     let mut db = store::connect(temp.path())?;
@@ -109,6 +179,15 @@ fn incremental_projection_recovers_and_filters_before_ranking() -> Result<()> {
     build(&mut db, false)?;
     assert_eq!(count.load(Ordering::Relaxed), 4);
     store::deactivate_missing(&mut db, &[b.id, c.id].into_iter().collect())?;
+    let active_matches = search_with(
+        &mut db,
+        temp.path(),
+        "proxy",
+        &Filter::default(),
+        10,
+        &ollama,
+    )?;
+    assert!(!active_matches.iter().any(|hit| hit.id == a.id));
     build(&mut db, false)?;
     let ids = embeddings::table
         .select(embeddings::id)
@@ -165,7 +244,7 @@ fn incremental_projection_recovers_and_filters_before_ranking() -> Result<()> {
         }
     })
     .unwrap_err();
-    assert!(error.to_string().contains("收藏资料已更新"));
+    assert!(error.is::<BuildConflict>());
     assert_eq!(generation(&mut db)?, current);
     build(&mut db, false)?;
     Ok(())
@@ -315,7 +394,7 @@ fn chunked_index_ranks_readme_suffix_reuses_vectors_and_rejects_changed_settings
         }
     })
     .unwrap_err();
-    assert!(err.to_string().contains("已变化"));
+    assert!(err.is::<BuildConflict>());
     assert_eq!(generation(&mut db)?, generation_before);
     assert!(needs_rebuild(&mut db)?);
     assert!(
@@ -391,7 +470,7 @@ fn changing_chunk_policy_during_inference_stops_the_next_batch_and_rejects_searc
     count.store(0, Ordering::SeqCst);
     change.store(true, Ordering::SeqCst);
     let err = build(&mut db, true, &|_| {}).unwrap_err();
-    assert!(err.to_string().contains("已变化"));
+    assert!(err.is::<BuildConflict>());
     assert_eq!(count.load(Ordering::SeqCst), 1);
     assert_eq!(generation(&mut db)?, original_generation);
     assert_eq!(store::meta(&mut db, "index_identity")?, original_identity);
@@ -408,8 +487,7 @@ fn changing_chunk_policy_during_inference_stops_the_next_batch_and_rejects_searc
     assert!(
         search(&mut db, "fixture", &Filter::default(), 1)
             .unwrap_err()
-            .to_string()
-            .contains("已变化")
+            .is::<BuildConflict>()
     );
     build(&mut db, true, &|_| {})?;
     assert_ne!(store::meta(&mut db, "index_identity")?, original_identity);

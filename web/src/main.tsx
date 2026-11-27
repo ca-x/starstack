@@ -7,7 +7,7 @@ import { api, message, request, type Stats } from "./api";
 import { Library } from "./Library";
 import { Login } from "./Login";
 import { Mcp } from "./Mcp";
-import { Maintenance, type Job, type JobReport } from "./Maintenance";
+import { Maintenance, type Job, type JobReport, type IndexProgress } from "./Maintenance";
 import { Statistics } from "./Statistics";
 import { Users } from "./Users";
 import { ProfileButton, type Profile } from "./Profile";
@@ -37,6 +37,8 @@ function Admin() {
   const [revision, setRevision] = useState(0);
   const [job, setJob] = useState<Job | null>(null);
   const [progress, setProgress] = useState("");
+  const [indexProgress, setIndexProgress] = useState<IndexProgress>();
+  const [catalogReport, setCatalogReport] = useState<JobReport>();
   const [jobReport, setJobReport] = useState<JobReport>();
   const [jobError, setJobError] = useState("");
   const [externalRunning, setExternalRunning] = useState(false);
@@ -76,8 +78,10 @@ function Admin() {
     const poll = async () => {
       let interval = 4000;
       try {
-        const result = await api<{ message: string | null; running?: boolean; report?: JobReport | null }>("progress", undefined, controller.signal);
+        const result = await api<{ message: string | null; running?: boolean; report?: JobReport | null; catalog_report?: JobReport | null; index_progress?: IndexProgress | null }>("progress", undefined, controller.signal);
         if (controller.signal.aborted) return;
+        setIndexProgress(result.index_progress ?? undefined);
+        setCatalogReport(result.catalog_report ?? undefined);
         if (busy.current) {
           if (result.message) setProgress(t(result.message));
           setJobReport(result.report ?? undefined);
@@ -100,7 +104,7 @@ function Admin() {
   async function run(next: Job, full: boolean, requestId?: string) {
     if (busy.current) return;
     busy.current = true;
-    setJob(next); setJobError(""); setJobReport(undefined);
+    setJob(next); setJobError(""); setJobReport(undefined); setIndexProgress(undefined);
     setProgress(t({ sync: "正在同步收藏…", index: "正在更新索引…", readmes: "正在提交 README 补全任务…" }[next]));
     const input = { sync: requestId ? { request_id: requestId } : { full }, index: { rebuild: full }, readmes: {} }[next];
     try {
@@ -134,7 +138,7 @@ function Admin() {
     <main id="main" className={`workspace${["#sync", "#users", "#mcp"].includes(route) ? " workspace--settings" : ""}`} tabIndex={-1} ref={main}>
       {statsError && <Failure error={statsError} retry={refresh} />}{logoutError && <Failure error={logoutError} />}
       {job && route !== "#sync" && <a href="#sync" className="progress-note">{progress || t("查看任务进度")} <Icon type="arrowRight" /></a>}
-      {route === "#sync" ? <Maintenance stats={stats} admin={profile.admin} job={job || (externalRunning ? "sync" : null)} progress={progress} report={jobReport} error={jobError} run={run} /> :
+      {route === "#sync" ? <Maintenance stats={stats} admin={profile.admin} job={job || (externalRunning ? "sync" : null)} progress={progress} indexProgress={indexProgress} catalogReport={catalogReport} report={jobReport} error={jobError} run={run} /> :
         route === "#users" && profile.admin ? <Users username={profile.username} /> : route === "#mcp" ? <Mcp /> : route === "#statistics" ? <Statistics stats={stats} tagLink={tagLink} /> :
         <Library key={route} stats={stats} tagLink={tagLink} initial={{ pinned: route === "#pinned" || undefined, tag }} revision={revision} onEdit={refresh} onSync={() => { location.hash = "sync"; }} />}
     </main>

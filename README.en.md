@@ -57,6 +57,10 @@ In a repository’s detail panel, generate a summary draft, edit it, and save it
 
 In **Sync & index → Schedule & quotas**, choose whether star sync, README enrichment, and AI auto-organization retry after temporary failures. StarStack uses exponential backoff for up to five retries and honors server retry delays. Star and README retries follow their schedule settings. AI organization resumes from saved progress. Authentication errors require attention.
 
+The web app queues semantic indexing as soon as a star sync commits. Repository metadata is indexed first, then scheduled README enrichment updates it. **Sync & index** shows newly computed and reused repositories, completed text chunks, processed tokens, and compute time. Built-in models count successfully processed non-padding tokens, including special tokens and overlapping windows. Ollama may omit the count. If indexing needs attention, correct the model in **Semantic index**. Select **Update index** after installing missing files, or **Rebuild index** after changing the model or chunking.
+
+Deleted, inaccessible, and unstarred repositories leave the library and search results after the next successful full sync. The next index update removes their vectors. Scheduled star sync checks the full list. Incremental sync reads recent stars.
+
 ### Built-in and remote search models
 
 Under **Sync & index → Model market**, an administrator can download the shared model files from Hugging Face or ModelScope, monitor progress, retry a download or remove an unused model. Operators can point either source at a trusted mirror with `STARSTACK_HF_ENDPOINT` or `STARSTACK_MODELSCOPE_ENDPOINT`. StarStack checks each file against the pinned model revision.

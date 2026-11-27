@@ -68,6 +68,8 @@ struct Job {
     message: String,
     running: bool,
     report: Option<JobReport>,
+    index_progress: Option<index::Progress>,
+    catalog_report: Option<JobReport>,
 }
 struct App {
     base: Library,
@@ -458,7 +460,7 @@ async fn read(
         "progress" => {
             let jobs = app.jobs.lock().expect("jobs lock poisoned");
             let job = jobs.get(&a.id);
-            json!({"message":job.map_or("", |j| j.message.as_str()), "running":job.is_some_and(|j|j.running), "report":job.and_then(|j|j.report.as_ref())})
+            json!({"message":job.map_or("", |j| j.message.as_str()), "running":job.is_some_and(|j|j.running), "report":job.and_then(|j|j.report.as_ref()),"index_progress":job.and_then(|j|j.index_progress),"catalog_report":job.and_then(|j|j.catalog_report.as_ref())})
         }
         _ => return Err(ApiError(StatusCode::NOT_FOUND,"没有此接口".into())),
     };
@@ -498,6 +500,10 @@ fn start_job(
         item.running = true;
         item.message = "准备中".into();
         item.report = None;
+        item.index_progress = None;
+        if operation != "index" {
+            item.catalog_report = None;
+        }
     }
     let op = operation.to_owned();
     Ok(tokio::spawn(async move { work(app, lib, op, input).await }))
@@ -521,9 +527,28 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
                     .or_default()
                     .message = msg.into();
             };
+            let build_index = |db: &mut store::Db, rebuild| {
+                store::set_meta(db, "index_pending", "1")?;
+                let result = index::build_observed(db, rebuild, &progress, &|counts| {
+                    state
+                        .jobs
+                        .lock()
+                        .expect("jobs lock poisoned")
+                        .entry(user.clone())
+                        .or_default()
+                        .index_progress = Some(counts);
+                });
+                if let Err(error) = &result
+                    && !error.is::<index::BuildConflict>()
+                {
+                    let message: String = error.to_string().chars().take(400).collect();
+                    store::set_meta(db, "index_issue", &message)?;
+                }
+                result
+            };
             match operation.as_str() {
                 "index" => Ok(JobReport {
-                    message: index::build(db, input.rebuild, &progress)?,
+                    message: build_index(db, input.rebuild)?,
                     ..JobReport::default()
                 }),
                 "readme" => {
@@ -534,7 +559,11 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
                     )?;
                     let mut report =
                         JobReport::from_sync(&crate::sync::enrich(db, &progress)?, false);
-                    report.add_step(index::build(db, false, &progress), "索引待更新");
+                    if store::meta(db, "index_pending")?.is_some()
+                        && store::meta(db, "index_issue")?.is_none()
+                    {
+                        report.add_step(build_index(db, false), "索引待更新");
+                    }
                     Ok(report)
                 }
                 _ => {
@@ -597,28 +626,20 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
             report.warnings.push(format!("计划在 {time} 自动重试。"));
         }
         item.message.clone_from(&report.message);
+        if catalog {
+            item.catalog_report = Some(report.clone());
+        }
         item.report = Some(report);
     }
     if catalog
-        && result
-            .as_ref()
-            .is_ok_and(|report| report.transient_delay.is_none())
+        && result.is_ok()
+        && lib
+            .run(|db| Ok(store::meta(db, "index_pending")?.is_some()))
+            .await
+            .unwrap_or(false)
     {
-        let enrich = lib
-            .run(|db| {
-                Ok(crate::quota::readme_interval(db)? > 0
-                    && crate::quota::Policy::load(db)?.readme_budget > 0
-                    && crate::quota::pending(db)? > 0
-                    && crate::retry::pending(db, "readme")?.is_none())
-            })
-            .await?;
-        // The next stage is independent of the browser connection.
-        let _background = start_job(
-            app,
-            lib,
-            if enrich { "readme" } else { "index" },
-            Run::default(),
-        );
+        // Publish metadata first. Periodic README batches enrich the same incremental index afterward.
+        let _background = start_job(app, lib, "index", Run::default());
     }
     result
 }
@@ -1035,6 +1056,11 @@ async fn schedule(app: Shared) {
             let due = lib
                 .run(|db| {
                     db.immediate_transaction(|db| {
+                        if store::meta(db, "index_pending")?.is_some()
+                            && store::meta(db, "index_issue")?.is_none()
+                        {
+                            return Ok(Some("index"));
+                        }
                         if !auth::has_github_credentials(db)? {
                             return Ok(None);
                         }

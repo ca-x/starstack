@@ -86,7 +86,8 @@ pub(crate) fn set_builtin(db: &mut Db, id: &str) -> Result<()> {
     crate::models::descriptor(&home, id)?;
     db.immediate_transaction(|db| {
         store::set_meta(db, "embedding_builtin_model", id)?;
-        store::set_meta(db, "embedding_backend", "builtin")
+        store::set_meta(db, "embedding_backend", "builtin")?;
+        store::delete_meta(db, "index_issue")
     })
 }
 
@@ -160,7 +161,10 @@ impl Provider {
 }
 
 pub(crate) fn configured_model(db: &mut Db) -> Result<String> {
-    Ok(Provider::selected(db)?.model().to_owned())
+    match backend(db)?.as_str() {
+        "builtin" => builtin_id(db),
+        _ => crate::ollama_settings::configured_model(db),
+    }
 }
 
 #[derive(PartialEq, Eq)]
@@ -248,6 +252,7 @@ struct Engine {
 struct Embeddings {
     model: Option<String>,
     embeddings: Vec<Vec<f32>>,
+    prompt_eval_count: Option<usize>,
 }
 
 impl Engine {
@@ -287,10 +292,7 @@ impl Engine {
 
     fn check_current(&self, db: &mut Db) -> Result<()> {
         if self.managed {
-            ensure!(
-                Selection::read(db)? == self.selection,
-                "嵌入后端、服务地址、模型或分块配置已变化，请重新执行"
-            );
+            ensure!(Selection::read(db)? == self.selection, BuildConflict);
         }
         Ok(())
     }
@@ -310,7 +312,12 @@ impl Engine {
         })
     }
 
-    fn embed(&self, db: &mut Db, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+    fn embed(
+        &self,
+        db: &mut Db,
+        texts: &[&str],
+        observed: &mut dyn FnMut(Option<usize>),
+    ) -> Result<Vec<Vec<f32>>> {
         // Re-check before sending each batch. A settings change during one request
         // must stop later batches from sending repository text to the former server.
         db.transaction(|db| self.check_current(db))?;
@@ -321,17 +328,25 @@ impl Engine {
                     files.get().context("内置模型不可用")?.path(),
                     family,
                     texts,
+                    &mut |tokens| observed(Some(tokens)),
                 )
             }
             (Runtime::Ollama(client), Provider::Ollama { url, model }) => {
-                ollama_embed(client, url, model, texts)
+                let (vectors, tokens) = ollama_embed(client, url, model, texts)?;
+                observed(tokens);
+                Ok(vectors)
             }
             _ => anyhow::bail!("嵌入配置不一致"),
         }
     }
 }
 
-fn ollama_embed(client: &Client, url: &str, model: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+fn ollama_embed(
+    client: &Client,
+    url: &str,
+    model: &str,
+    texts: &[&str],
+) -> Result<(Vec<Vec<f32>>, Option<usize>)> {
     let response = client
         .post(format!("{url}/api/embed"))
         .json(&serde_json::json!({"model": model, "input": texts}))
@@ -367,7 +382,7 @@ fn ollama_embed(client: &Client, url: &str, model: &str, texts: &[&str]) -> Resu
         vectors.iter().all(|v| valid(v)),
         "Ollama 返回了空向量、全零向量或非有限值，请检查模型"
     );
-    Ok(vectors)
+    Ok((vectors, payload.prompt_eval_count))
 }
 fn valid(vector: &[f32]) -> bool {
     !vector.is_empty() && vector.iter().any(|v| *v != 0.0) && vector.iter().all(|v| v.is_finite())
@@ -516,19 +531,70 @@ fn cached_vectors(
     Ok(vectors)
 }
 
+#[derive(Debug)]
+pub(crate) struct BuildConflict;
+
+impl std::fmt::Display for BuildConflict {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("建索引期间收藏资料或嵌入配置已更新，请重试 starstack index")
+    }
+}
+
+impl std::error::Error for BuildConflict {}
+
+#[derive(Clone, Copy, serde::Serialize)]
+pub(crate) struct Progress {
+    pub repositories: usize,
+    pub total: usize,
+    pub reused: usize,
+    pub chunks: usize,
+    pub tokens: Option<usize>,
+    pub elapsed_seconds: u64,
+}
+
 pub(crate) fn build(conn: &mut Db, rebuild: bool, progress: &dyn Fn(&str)) -> Result<String> {
+    build_observed(conn, rebuild, progress, &|counts| {
+        let tokens = counts
+            .tokens
+            .map_or_else(|| "未报告 token 数".into(), |n| format!("{n} token"));
+        progress(&format!(
+            "仓库 {}/{}，已处理 {} 段文本，{}，用时 {} 秒",
+            counts.repositories, counts.total, counts.chunks, tokens, counts.elapsed_seconds
+        ));
+    })
+}
+
+pub(crate) fn build_observed(
+    conn: &mut Db,
+    rebuild: bool,
+    progress: &dyn Fn(&str),
+    observe: &dyn Fn(Progress),
+) -> Result<String> {
+    progress("正在检查索引模型和待处理仓库");
     let engine = Engine::configured(conn)?;
     engine.acquire()?;
     let dir = store::data_dir(conn)?;
-    build_with(conn, &dir, rebuild, &engine, progress)
+    build_observed_with(conn, &dir, rebuild, &engine, progress, observe)
 }
 
+#[cfg(test)]
 fn build_with(
     conn: &mut Db,
     dir: &Path,
     rebuild: bool,
     engine: &Engine,
     progress: &dyn Fn(&str),
+) -> Result<String> {
+    build_observed_with(conn, dir, rebuild, engine, progress, &|_| {})
+}
+
+fn build_observed_with(
+    conn: &mut Db,
+    dir: &Path,
+    rebuild: bool,
+    engine: &Engine,
+    progress: &dyn Fn(&str),
+    observe: &dyn Fn(Progress),
 ) -> Result<String> {
     let key = engine.selection.identity();
     let owner = store::owner(conn)?;
@@ -565,40 +631,79 @@ fn build_with(
             engine.check_current(db)?;
             ensure!(
                 build_generation(db, rebuild)? == current && library_revision(db)? == revision,
-                "收藏资料已更新，请重试 starstack index"
+                BuildConflict
             );
-            store::set_meta(db, "indexed_library_revision", &revision)
+            finish_index(db, &revision)
         })?;
+        observe(Progress {
+            repositories: 0,
+            total: 0,
+            reused: docs.len(),
+            chunks: 0,
+            tokens: Some(0),
+            elapsed_seconds: 0,
+        });
         return Ok(format!("索引已是最新，共 {} 个仓库", docs.len()));
     }
 
-    for (i, group) in missing.chunks(BATCH).enumerate() {
-        progress(&format!(
-            "正在为仓库计算向量（第 {}–{} 个，共 {} 个）",
-            i * BATCH + 1,
-            i * BATCH + group.len(),
-            missing.len()
-        ));
-        // Read README bodies for the changed IDs a group at a time, outside the
-        // transaction during inference. Recheck fingerprints and revision before publishing.
+    let start = std::time::Instant::now();
+    let mut counts = Progress {
+        repositories: 0,
+        total: missing.len(),
+        reused: vectors.len(),
+        chunks: 0,
+        tokens: Some(0),
+        elapsed_seconds: 0,
+    };
+    progress("正在计算仓库向量");
+    observe(counts);
+    for group in missing.chunks(BATCH) {
+        // Do not hold a SQLite transaction during inference.
         let mut means: Vec<_> = (0..group.len()).map(|_| mean::Mean::default()).collect();
         let mut batch = Vec::with_capacity(BATCH);
+        let mut finished = Vec::with_capacity(BATCH);
+        let mut flush = |db: &mut Db,
+                         batch: &mut Vec<(usize, String)>,
+                         means: &mut [mean::Mean],
+                         finished: &mut Vec<bool>|
+         -> Result<()> {
+            embed_fragments(db, engine, batch, means, &mut |tokens| {
+                counts.tokens = counts
+                    .tokens
+                    .zip(tokens)
+                    .map(|(total, batch)| total.saturating_add(batch));
+                counts.elapsed_seconds = start.elapsed().as_secs();
+                observe(counts);
+            })?;
+            counts.chunks += batch.len();
+            counts.repositories += finished.iter().filter(|&&done| done).count();
+            counts.elapsed_seconds = start.elapsed().as_secs();
+            observe(counts);
+            batch.clear();
+            finished.clear();
+            Ok(())
+        };
         for (idx, doc) in group.iter().enumerate() {
-            let text = document(&store::by_id(conn, doc.id)?);
-            ensure!(
-                fingerprint(&key, &text) == doc.hash,
-                "建索引期间收藏资料已更新，请重试 starstack index"
-            );
-            for fragment in engine.selection.policy.split(&text) {
+            let repo = match store::by_id(conn, doc.id) {
+                Ok(repo) => repo,
+                Err(error) => {
+                    ensure!(library_revision(conn)? == revision, BuildConflict);
+                    return Err(error);
+                }
+            };
+            let text = document(&repo);
+            ensure!(fingerprint(&key, &text) == doc.hash, BuildConflict);
+            let mut fragments = engine.selection.policy.split(&text).into_iter().peekable();
+            while let Some(fragment) = fragments.next() {
                 batch.push((idx, fragment));
+                finished.push(fragments.peek().is_none());
                 if batch.len() == BATCH {
-                    embed_fragments(conn, engine, &batch, &mut means)?;
-                    batch.clear();
+                    flush(conn, &mut batch, &mut means, &mut finished)?;
                 }
             }
         }
         if !batch.is_empty() {
-            embed_fragments(conn, engine, &batch, &mut means)?;
+            flush(conn, &mut batch, &mut means, &mut finished)?;
         }
         for (doc, mean) in group.iter().zip(means) {
             vectors.insert(doc.id, mean.finish()?);
@@ -642,14 +747,8 @@ fn build_with(
     // write or crash leaves the previously committed projection and its matching cache intact.
     conn.immediate_transaction(|db| {
         engine.check_current(db)?;
-        ensure!(
-            build_generation(db, rebuild)? == current,
-            "另一个进程已更新索引，请重试 starstack index"
-        );
-        ensure!(
-            library_revision(db)? == revision,
-            "建索引期间收藏资料已更新，请重试 starstack index"
-        );
+        ensure!(build_generation(db, rebuild)? == current, BuildConflict);
+        ensure!(library_revision(db)? == revision, BuildConflict);
         let destination = artifact_path(dir, &owner, next);
         if destination.try_exists()? {
             fs::remove_file(&destination)?;
@@ -697,7 +796,7 @@ fn build_with(
         } else {
             store::set_meta(db, "index_dimension", &dimension.to_string())?;
         }
-        store::set_meta(db, "indexed_library_revision", &revision)?;
+        finish_index(db, &revision)?;
         Ok(format!(
             "索引已更新，共 {} 个仓库，新计算 {} 个，复用 {} 个",
             docs.len(),
@@ -707,14 +806,21 @@ fn build_with(
     })
 }
 
+fn finish_index(db: &mut Db, revision: &str) -> Result<()> {
+    store::set_meta(db, "indexed_library_revision", revision)?;
+    store::delete_meta(db, "index_pending")?;
+    store::delete_meta(db, "index_issue")
+}
+
 fn embed_fragments(
     db: &mut Db,
     engine: &Engine,
     batch: &[(usize, String)],
     means: &mut [mean::Mean],
+    observed: &mut dyn FnMut(Option<usize>),
 ) -> Result<()> {
     let texts: Vec<_> = batch.iter().map(|(_, text)| text.as_str()).collect();
-    let vectors = engine.embed(db, &texts)?;
+    let vectors = engine.embed(db, &texts, observed)?;
     ensure!(vectors.len() == texts.len(), "嵌入数量与文本分块数量不一致");
     for ((idx, _), vector) in batch.iter().zip(vectors) {
         means[*idx].push(&vector)?;
@@ -846,7 +952,7 @@ fn search_with(
         query.to_owned()
     };
     let vector = engine
-        .embed(conn, &[&prompt])?
+        .embed(conn, &[&prompt], &mut |_| {})?
         .pop()
         .context("missing query embedding")?;
     ensure!(

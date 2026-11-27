@@ -100,16 +100,19 @@ pub(crate) fn selected(db: &mut Db) -> Result<(String, String)> {
         }
         None => urls.first().context("请先添加 Ollama 服务地址")?.clone(),
     };
+    Ok((url, configured_model(db)?))
+}
+
+pub(crate) fn configured_model(db: &mut Db) -> Result<String> {
     let legacy = if store::meta(db, "index_backend")?.is_none_or(|s| s == "ollama") {
         store::meta(db, "index_model")?
     } else {
         None
     };
-    let model = store::meta(db, "ollama_model")?
+    Ok(store::meta(db, "ollama_model")?
         .or_else(|| var("STARSTACK_MODEL"))
         .or(legacy)
-        .unwrap_or_else(|| FALLBACK_MODEL.into());
-    Ok((url, model))
+        .unwrap_or_else(|| FALLBACK_MODEL.into()))
 }
 
 pub(crate) fn set(db: &mut Db, url: Option<&str>, model: Option<&str>) -> Result<()> {

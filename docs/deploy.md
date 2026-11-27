@@ -157,6 +157,8 @@ REST 分页支持 gzip 传输。一次无凭据的公开样本中，100 条 Star
 
 在「同步与索引 → 计划与额度」可分别开关收藏同步、README 补全和 AI 自动整理的失败重试。临时失败会指数退避，最多补试五次，并遵循服务端要求的等待时间。同步与 README 的重试受各自的定时设置约束。AI 整理从已保存的进度继续，认证错误需要手动处理。
 
+Web 端在收藏提交后自动更新语义索引，计划中的 README 补全会继续更新变更仓库。后台进度显示新计算和复用的仓库数、文本块和实际 token 数。Ollama 未返回计数时会明确标记。模型不可用时，进入「同步与索引」按提示修正，再手动更新或重建索引。完整全量同步才会确认仓库移除，也可在「计划与额度」配置全量同步频率。
+
 ### 配置 GitHub 设备授权
 
 1. 在 GitHub 的 **Settings → Developer settings → OAuth Apps** 选择 **New OAuth App**。填写应用名称与 **Homepage URL**，例如 `https://github.com/ca-x/starstack`。**Redirect URI**（旧版表单称为 **Authorization callback URL**）填同一个主页地址。星栈会通过设备码轮询授权结果，无需部署回调路径。

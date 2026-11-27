@@ -577,6 +577,10 @@ fn synchronize_account(
         } else if cutoff.is_none() {
             store::set_meta(db, "retry_full_sync", "1")?;
         }
+        let indexed = store::meta(db, "indexed_library_revision")?;
+        if indexed.is_none() || indexed != store::meta(db, "library_revision")? {
+            store::set_meta(db, "index_pending", "1")?;
+        }
         checkpoint(db, &pending, &mut summary, mode)
     })?;
     gh.quota.save(conn, Resource::Rest)?;
@@ -810,6 +814,9 @@ fn enrich_queue(
         }
         db.immediate_transaction::<_, anyhow::Error, _>(|db| {
             advance_revision(db, revision)?;
+            if !fetched.is_empty() {
+                store::set_meta(db, "index_pending", "1")?;
+            }
             for repo in fetched {
                 store::upsert(db, &repo)?;
                 pending.remove(&repo.id);

@@ -116,11 +116,20 @@ fn load_bert(dir: &Path) -> Result<Encoder> {
 
 pub(crate) fn validate_custom_bert(dir: &Path) -> Result<()> {
     let encoder = load_bert(dir)?;
-    embed_bert(&encoder, &["StarStack model check / 本地模型校验"])?;
+    embed_bert(
+        &encoder,
+        &["StarStack model check / 本地模型校验"],
+        &mut |_| {},
+    )?;
     Ok(())
 }
 
-pub(crate) fn embed(dir: &Path, family: &str, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+pub(crate) fn embed(
+    dir: &Path,
+    family: &str,
+    texts: &[&str],
+    observed: &mut dyn FnMut(usize),
+) -> Result<Vec<Vec<f32>>> {
     if texts.is_empty() {
         return Ok(Vec::new());
     }
@@ -135,39 +144,54 @@ pub(crate) fn embed(dir: &Path, family: &str, texts: &[&str]) -> Result<Vec<Vec<
         *cache = Some((dir.to_owned(), model));
     }
     match &cache.as_ref().context("内置模型不可用")?.1 {
-        Model::Bert(encoder) => embed_bert(encoder, texts),
-        Model::Qwen(encoder) => encoder.embed(texts),
+        Model::Bert(encoder) => embed_bert(encoder, texts, observed),
+        Model::Qwen(encoder) => encoder.embed(texts, observed),
     }
 }
 
-fn embed_bert(encoder: &Encoder, texts: &[&str]) -> Result<Vec<Vec<f32>>> {
+fn embed_bert(
+    encoder: &Encoder,
+    texts: &[&str],
+    observed: &mut dyn FnMut(usize),
+) -> Result<Vec<Vec<f32>>> {
     let encodings = encoder
         .tokenizer
         .encode_batch(texts.to_vec(), true)
         .map_err(|e| anyhow!("本地分词失败（{e}）"))?;
     let mut means: Vec<_> = (0..texts.len()).map(|_| Mean::default()).collect();
-    let mut batch = Vec::with_capacity(16);
-    for (i, mut first) in encodings.into_iter().enumerate() {
+    let mut original_vectors = Vec::new();
+    let mut windows = Vec::new();
+    for (text, mut first) in encodings.into_iter().enumerate() {
         let rest = first.take_overflowing();
         for window in std::iter::once(first).chain(rest) {
-            batch.push((i, window));
-            if batch.len() == 16 {
-                infer_batch(encoder, &mut batch, &mut means)?;
-                batch.clear();
-            }
+            let ordinal = original_vectors.len();
+            original_vectors.push((text, None));
+            windows.push((ordinal, window));
         }
     }
-    if !batch.is_empty() {
-        infer_batch(encoder, &mut batch, &mut means)?;
+    // Right padding does not change token positions. Group similar lengths to
+    // cut padding work, then pool in original window order.
+    if matches!(
+        encoder.padding.direction,
+        tokenizers::PaddingDirection::Right
+    ) {
+        windows.sort_by_key(|(_, window)| window.len());
+    }
+    for batch in windows.chunks_mut(16) {
+        let tokens: usize = batch.iter().map(|(_, window)| window.len()).sum();
+        let vectors = infer_batch(encoder, batch)?;
+        for ((ordinal, _), vector) in batch.iter().zip(vectors) {
+            original_vectors[*ordinal].1 = Some(vector);
+        }
+        observed(tokens);
+    }
+    for (text, vector) in original_vectors {
+        means[text].push(&vector.context("缺少内置模型窗口向量")?)?;
     }
     means.into_iter().map(Mean::finish).collect()
 }
 
-fn infer_batch(
-    encoder: &Encoder,
-    encodings: &mut [(usize, Encoding)],
-    means: &mut [Mean],
-) -> Result<()> {
+fn infer_batch(encoder: &Encoder, encodings: &mut [(usize, Encoding)]) -> Result<Vec<Vec<f32>>> {
     let width = encodings
         .iter()
         .map(|(_, window)| window.len())
@@ -212,10 +236,7 @@ fn infer_batch(
         vectors.len() == encodings.len() && vectors.iter().all(|v| v.len() == DIMENSION),
         "内置模型返回无效的向量形状"
     );
-    for ((owner, _), vector) in encodings.iter().zip(vectors) {
-        means[*owner].push(&vector)?;
-    }
-    Ok(())
+    Ok(vectors)
 }
 
 #[cfg(test)]
@@ -247,12 +268,13 @@ mod tests {
                 "如何清理相似照片？",
                 "查找内存分配性能瓶颈",
             ],
+            &mut |_| {},
         )?;
         let dot = |a: &[f32], b: &[f32]| a.iter().zip(b).map(|(x, y)| x * y).sum::<f32>();
         for i in 0..2 {
             assert!(dot(&rows[i], &rows[i + 2]) > dot(&rows[1 - i], &rows[i + 2]) + 0.025);
         }
-        let solo = embed(&dir, "minilm", &["如何清理相似照片？"])?;
+        let solo = embed(&dir, "minilm", &["如何清理相似照片？"], &mut |_| {})?;
         assert!(dot(&rows[2], &solo[0]) > 0.999);
         Ok(())
     }

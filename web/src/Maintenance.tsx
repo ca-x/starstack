@@ -1,4 +1,4 @@
-import { t } from "./locale";
+import { getLocale, t } from "./locale";
 import { useEffect, useState } from "react";
 import { EuiButton, EuiButtonEmpty, EuiConfirmModal, EuiTab, EuiTabs } from "@elastic/eui";
 import { api, date, message, type Stats } from "./api";
@@ -98,15 +98,38 @@ const tabs = [
 ] as const;
 
 export interface JobReport { message: string; warnings: string[]; details: string[] }
+export interface IndexProgress {
+  repositories: number; total: number; reused: number; chunks: number; tokens: number | null; elapsed_seconds: number;
+}
 export type Job = "sync" | "index" | "readmes";
-export function Maintenance({ stats, admin, job, progress, report, error, run }: {
-  stats: Stats; admin: boolean; job: Job | null; progress: string; report: JobReport | undefined; error: string; run: (job: Job, full: boolean, requestId?: string) => Promise<void>;
+export function Maintenance({ stats, admin, job, progress, indexProgress, catalogReport, report, error, run }: {
+  stats: Stats; admin: boolean; job: Job | null; progress: string; indexProgress?: IndexProgress; catalogReport?: JobReport; report: JobReport | undefined; error: string; run: (job: Job, full: boolean, requestId?: string) => Promise<void>;
 }) {
   const [active, setActive] = useState<(typeof tabs)[number][0]>("sync");
+  function openTab(id: "market" | "index") {
+    setActive(id);
+    document.getElementById(`maintenance-tab-${id}`)?.focus();
+  }
+  const number = new Intl.NumberFormat(getLocale());
   return <>
     <div className="page-heading"><div><h1>{t("同步与索引")}</h1><p>{t("连接 GitHub、更新收藏并维护本地语义索引。")}</p></div></div>
     {progress && <div className={`job-notice${report?.warnings.length ? " job-notice--warning" : ""}`}>
       <div role="status"><strong>{progress}</strong>{report?.warnings.map((warning, i) => <p key={i}>{t(warning)}</p>)}</div>
+      {indexProgress && <div className="index-job-progress">
+        {indexProgress.total > 0 && <progress aria-label={t("仓库向量计算进度")} value={indexProgress.repositories} max={indexProgress.total} />}
+        <dl>
+          <div><dt>{t("新计算仓库")}</dt><dd>{number.format(indexProgress.repositories)} / {number.format(indexProgress.total)}</dd></div>
+          <div><dt>{t("复用仓库")}</dt><dd>{number.format(indexProgress.reused)}</dd></div>
+          <div><dt>{t("已处理文本块")}</dt><dd>{number.format(indexProgress.chunks)}</dd></div>
+          <div><dt>{t("已处理 token")}</dt><dd>{indexProgress.tokens === null ? t("服务未报告") : number.format(indexProgress.tokens)}</dd></div>
+          <div><dt>{t("计算用时（秒）")}</dt><dd>{number.format(indexProgress.elapsed_seconds)}</dd></div>
+        </dl>
+      </div>}
+      {catalogReport && catalogReport.message !== report?.message && (
+        <details><summary>{t(catalogReport.message)}</summary>
+          {[...catalogReport.warnings, ...catalogReport.details].map((entry, i) => <p key={i}>{t(entry)}</p>)}
+        </details>
+      )}
       {!!report?.details.length && <details><summary>{t("任务日志")}</summary><ul>{report.details.map((detail, i) =>
         <li key={i}>{t(detail)}</li>)}</ul></details>}
     </div>}
@@ -131,10 +154,7 @@ export function Maintenance({ stats, admin, job, progress, report, error, run }:
         <div className="row-controls"><EuiButton fill isDisabled={!!job} onClick={() => run("sync", false)}>{t("增量同步")}</EuiButton>
           <EuiButton isDisabled={!!job} onClick={() => run("sync", true)}>{t("全量同步")}</EuiButton></div></section>
     </div>
-    <EmbeddingModels active={active} openMarket={() => {
-      setActive("market");
-      document.getElementById("maintenance-tab-market")?.focus();
-    }} admin={admin} jobActive={!!job} index={rebuild => run("index", rebuild)} fallbackModel={stats.model} />
+    <EmbeddingModels active={active} openMarket={() => openTab("market")} openIndex={() => openTab("index")} admin={admin} jobActive={!!job} index={rebuild => run("index", rebuild)} fallbackModel={stats.model} />
     <div className="operations" hidden={active !== "chat"} role="tabpanel" id="maintenance-panel-chat" aria-labelledby="maintenance-tab-chat">
       <ChatSettings admin={admin} active={active === "chat"} />
     </div>
