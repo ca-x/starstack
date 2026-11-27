@@ -1,4 +1,8 @@
-use crate::store::Repo;
+use crate::{
+    chat_settings::{ApiType, Config},
+    store::Repo,
+};
+use aimux_core::error::AiMuxError;
 use aimux_core::generate::{GenerateTextOptions, generate_text};
 use aimux_core::options::TimeoutConfiguration;
 use aimux_providers::{PresetSettings, create_provider};
@@ -16,6 +20,7 @@ struct ChatModel {
     provider: String,
     model: String,
     settings: PresetSettings,
+    api_type: ApiType,
 }
 
 impl ChatModel {
@@ -25,15 +30,20 @@ impl ChatModel {
             crate::chat_settings::get(&mut db)
         })
         .await??;
-        Ok(Self {
+        Ok(Self::from(cfg))
+    }
+
+    fn from(cfg: Config) -> Self {
+        Self {
             provider: cfg.provider,
             model: cfg.model,
+            api_type: cfg.api_type,
             settings: PresetSettings {
                 base_url: cfg.base_url,
                 api_key: cfg.api_key.map(Into::into),
                 ..Default::default()
             },
-        })
+        }
     }
 
     async fn answer(self, question: &str, repos: &[Repo]) -> Result<String> {
@@ -64,8 +74,9 @@ impl ChatModel {
     async fn generate(self, prompt: String, instructions: &str, max_tokens: u32) -> Result<String> {
         let provider = create_provider(&self.provider, self.settings)
             .with_context(|| format!("初始化 Aimux 服务商 {} 失败", self.provider))?;
-        let model = provider
-            .language_model(&self.model)
+        let model = self
+            .api_type
+            .model(provider.as_ref(), &self.model)
             .with_context(|| format!("选择对话模型 {} 失败", self.model))?;
         let options = GenerateTextOptions {
             instructions: Some(instructions.to_owned()),
@@ -79,16 +90,59 @@ impl ChatModel {
         };
         let result = generate_text(model.as_ref(), prompt, options)
             .await
-            .with_context(|| {
-                format!(
-                    "Aimux 无法调用 {}/{}，请检查聊天服务及模型是否可用",
-                    self.provider, self.model
-                )
-            })?;
+            .map_err(generation_error)?;
         let text = result.text();
         ensure!(!text.trim().is_empty(), "聊天服务返回了空回答");
         Ok(text.trim().to_owned())
     }
+}
+
+fn generation_error(error: AiMuxError) -> anyhow::Error {
+    if let AiMuxError::ApiCall(detail) = &error {
+        let needs_email = |message: &str| {
+            message.contains("ModelScope") && message.contains("email verification")
+        };
+        if detail.status_code == Some(403)
+            && (needs_email(&detail.message)
+                || detail.response_body.as_deref().is_some_and(needs_email))
+        {
+            return anyhow::anyhow!(
+                "上游 ModelScope 要求完成邮箱验证（HTTP 403）。请在 ModelScope 完成验证，或选择其他模型。"
+            );
+        }
+        if detail.status_code.is_none() && detail.message.contains("exchange response timeout") {
+            return anyhow::anyhow!(
+                "聊天服务在 30 秒内未返回结果。请重试，或检查网关与上游模型的响应时间。"
+            );
+        }
+    }
+    let message = match error.status_code() {
+        Some(400 | 404 | 405 | 422) => "请检查 API 基址、请求类型及模型名称",
+        Some(401 | 403) => "请检查网关密钥及上游模型的授权",
+        Some(429) => "请求已达限额，请稍后重试或检查上游额度",
+        Some(500..=599) => "网关或上游模型暂时不可用，请稍后重试",
+        _ if matches!(error, AiMuxError::Timeout { .. }) => {
+            "聊天服务响应超时，请重试或选择响应更快的模型"
+        }
+        _ => "无法调用聊天服务，请检查网络、服务地址和所选请求类型",
+    };
+    if let Some(status) = error.status_code() {
+        anyhow::anyhow!("聊天服务返回 HTTP {status}。{message}。")
+    } else {
+        anyhow::anyhow!("{message}。")
+    }
+}
+
+pub(crate) async fn test_connection(cfg: Config) -> Result<()> {
+    cfg.validate()?;
+    ensure!(!cfg.provider.is_empty(), "请选择聊天服务商");
+    tokio::time::timeout(
+        std::time::Duration::from_secs(32),
+        ChatModel::from(cfg).generate("Reply with OK.".into(), "Respond briefly.", 512),
+    )
+    .await
+    .context("聊天服务响应超时，请重试或选择响应更快的模型")??;
+    Ok(())
 }
 
 pub(crate) async fn search_keywords(question: &str) -> Result<String> {
@@ -257,6 +311,58 @@ mod tests {
     use serde_json::Value;
 
     #[tokio::test]
+    async fn openai_protocol_routes_to_the_selected_api() -> Result<()> {
+        let server = Server::new(|request| {
+            let body: Value = serde_json::from_slice(&request.body).unwrap();
+            assert_eq!(body["model"], "fixture-model");
+            assert!(
+                request
+                    .headers
+                    .contains("authorization: bearer fixture-key")
+            );
+            match request.target.as_str() {
+                "/v1/responses" => {
+                    assert!(body["input"].is_array());
+                    assert!(body.get("messages").is_none());
+                    Reply::json(json!({
+                        "id":"resp_fixture", "object":"response", "created_at":1, "status":"completed",
+                        "model":"fixture-model", "output":[{"id":"msg_fixture","type":"message","role":"assistant",
+                            "status":"completed","content":[{"type":"output_text","text":"Responses OK","annotations":[]}]}],
+                        "usage":{"input_tokens":1,"output_tokens":1,"total_tokens":2}
+                    }))
+                }
+                "/v1/chat/completions" => {
+                    assert!(body["messages"].is_array());
+                    assert!(body.get("input").is_none());
+                    Reply::json(json!({
+                        "id":"fixture","object":"chat.completion","created":1,"model":"fixture-model",
+                        "choices":[{"index":0,"message":{"role":"assistant","content":"Chat OK"},"finish_reason":"stop"}]
+                    }))
+                }
+                other => panic!("unexpected path {other}"),
+            }
+        });
+        for (kind, expected) in [
+            (ApiType::Auto, "Responses OK"),
+            (ApiType::Responses, "Responses OK"),
+            (ApiType::ChatCompletions, "Chat OK"),
+        ] {
+            let model = ChatModel::from(Config {
+                provider: "openai".into(),
+                model: "fixture-model".into(),
+                base_url: Some(format!("{}/v1", server.url)),
+                api_key: Some("fixture-key".into()),
+                api_type: kind,
+            });
+            assert_eq!(
+                model.generate("Reply".into(), "Brief response", 32).await?,
+                expected
+            );
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn aimux_sends_only_five_sources_and_omits_private_fields() {
         let server = Server::new(|request| {
             assert_eq!(request.target, "/v1/chat/completions");
@@ -282,6 +388,7 @@ mod tests {
         let chat = ChatModel {
             provider: "ollama".into(),
             model: "fixture-chat".into(),
+            api_type: ApiType::Auto,
             settings: PresetSettings {
                 base_url: Some(format!("{}/v1", server.url)),
                 ..Default::default()

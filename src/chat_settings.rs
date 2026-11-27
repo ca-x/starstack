@@ -5,12 +5,40 @@ use diesel::prelude::*;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+#[derive(Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ApiType {
+    #[default]
+    Auto,
+    Responses,
+    ChatCompletions,
+}
+
+impl ApiType {
+    pub fn model(
+        self,
+        provider: &dyn aimux_core::Provider,
+        id: &str,
+    ) -> Result<std::sync::Arc<dyn aimux_core::LanguageModel>> {
+        let api = match self {
+            Self::Auto => return Ok(provider.language_model(id)?),
+            Self::Responses => aimux_core::LanguageApi::Responses,
+            Self::ChatCompletions => aimux_core::LanguageApi::Chat,
+        };
+        Ok(provider
+            .language_model_with_api(api, id)
+            .context("此聊天服务商不支持所选的 OpenAI 请求类型")??)
+    }
+}
+
 #[derive(Default, Serialize, Deserialize)]
 pub(crate) struct Config {
     pub provider: String,
     pub model: String,
     pub base_url: Option<String>,
     pub api_key: Option<String>,
+    #[serde(default)]
+    pub api_type: ApiType,
 }
 
 fn env(name: &str) -> Option<String> {
@@ -18,7 +46,7 @@ fn env(name: &str) -> Option<String> {
 }
 
 impl Config {
-    fn validate(&self) -> Result<()> {
+    pub(crate) fn validate(&self) -> Result<()> {
         self.validate_endpoint()?;
         if !self.provider.is_empty() {
             ensure!(
@@ -56,6 +84,10 @@ impl Config {
             self.provider != "ollama" || self.base_url.is_some(),
             "请明确设置 Ollama 聊天地址（例如 https://ollama.example.com/v1）"
         );
+        ensure!(
+            self.api_type == ApiType::Auto || self.provider == "openai",
+            "OpenAI 请求类型仅适用于 OpenAI 和 OpenAI 兼容服务"
+        );
         if let Some(url) = &self.base_url {
             crate::ollama_settings::canonical_url(url)?;
         }
@@ -89,6 +121,14 @@ fn effective(db: &mut Db) -> Result<(Config, bool)> {
                 model: env("STARSTACK_AI_MODEL").unwrap_or_default(),
                 base_url,
                 api_key: env("STARSTACK_AI_API_KEY"),
+                api_type: match env("STARSTACK_AI_API_TYPE").as_deref() {
+                    None | Some("auto") => ApiType::Auto,
+                    Some("responses") => ApiType::Responses,
+                    Some("chat_completions") => ApiType::ChatCompletions,
+                    _ => anyhow::bail!(
+                        "STARSTACK_AI_API_TYPE 支持 auto、responses、chat_completions"
+                    ),
+                },
             },
             true,
         ))
@@ -109,7 +149,7 @@ pub(crate) fn status(db: &mut Db, admin: bool) -> Result<Value> {
     let (cfg, env) = effective(db)?;
     Ok(
         json!({"configured":!cfg.provider.is_empty() && cfg.validate().is_ok(),"managed_by_env":env,"provider":cfg.provider,"model":cfg.model,
-      "base_url":if admin{cfg.base_url}else{None},"has_key":admin && cfg.api_key.is_some()}),
+      "api_type":cfg.api_type,"base_url":if admin{cfg.base_url}else{None},"has_key":admin && cfg.api_key.is_some()}),
     )
 }
 #[derive(Deserialize)]
@@ -120,6 +160,7 @@ pub(crate) struct Input {
     model: String,
     base_url: Option<String>,
     api_key: Option<String>,
+    api_type: Option<ApiType>,
     #[serde(default)]
     clear_key: bool,
 }
@@ -140,6 +181,13 @@ pub(crate) fn draft(db: &mut Db, input: Input) -> Result<Config> {
         Config::default()
     } else {
         Config {
+            api_type: input.api_type.unwrap_or_else(|| {
+                if provider == old.provider {
+                    old.api_type
+                } else {
+                    ApiType::Auto
+                }
+            }),
             provider,
             model: input.model.trim().to_owned(),
             base_url,

@@ -516,6 +516,16 @@ const english: Record<string, string> = {
   "已记录 {0} 条提交": "{0} commits recorded",
   "最近基线": "Latest baseline",
   "提交基线需要核对": "Review the commit baseline",
+  "OpenAI 请求类型": "OpenAI API type",
+  "自动（服务商默认）": "Automatic (provider default)",
+  "例如 https://gateway.example.com/v1。只填写 API 基址。": "For example, https://gateway.example.com/v1. Enter the API base URL.",
+  "测试模型": "Test model",
+  "模型响应正常，耗时 {0} 毫秒。": "The model responded in {0} ms.",
+  "此聊天服务商不支持所选的 OpenAI 请求类型": "This provider does not support the selected OpenAI API type.",
+  "OpenAI 请求类型仅适用于 OpenAI 和 OpenAI 兼容服务": "Select an OpenAI API type only for an OpenAI or OpenAI-compatible service.",
+  "聊天服务在 30 秒内未返回结果。请重试，或检查网关与上游模型的响应时间。": "The chat service did not return a result within 30 seconds. Try again or check the gateway and upstream latency.",
+  "上游 ModelScope 要求完成邮箱验证（HTTP 403）。请在 ModelScope 完成验证，或选择其他模型。": "The upstream ModelScope account needs email verification (HTTP 403). Verify it in ModelScope or choose a different model.",
+  "聊天服务响应超时，请重试或选择响应更快的模型": "The chat request timed out. Try again or choose a faster model.",
   "GitHub 来源": "GitHub source"
 };
 

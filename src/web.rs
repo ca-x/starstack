@@ -660,16 +660,22 @@ async fn write(
             let mime = match q.format { Format::Json=>"application/json", Format::Markdown=>"text/markdown; charset=utf-8" };
             return Ok(([(header::CONTENT_TYPE,mime)],text).into_response());
         }
-        "chat" | "chat/models" if !a.admin=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
+        "chat" | "chat/models" | "chat/test" if !a.admin=>return Err(ApiError(StatusCode::FORBIDDEN,"需要管理员权限".into())),
         "chat" => {
             let input=value(body)?;
             lib.run(move|db|db.immediate_transaction(|db|{verify_admin(db,&a)?;crate::chat_settings::update(db,input)})).await?;
             json!({"message":"AI 聊天服务设置已保存"})
         }
-        "chat/models" => {
+        "chat/models" | "chat/test" => {
             let input=value(body)?;
             let cfg=lib.run(move|db|{verify_admin(db,&a)?;crate::chat_settings::draft(db,input)}).await?;
-            json!({"models":crate::chat_settings::models(cfg).await?})
+            if path == "chat/test" {
+                let start=Instant::now();
+                ai::test_connection(cfg).await?;
+                json!({"elapsed_ms":start.elapsed().as_millis()})
+            } else {
+                json!({"models":crate::chat_settings::models(cfg).await?})
+            }
         }
         "models/search" => {let input=value(body)?;lib.run(move|db|crate::model_hub::search(db,input)).await?}
         "organize/preview" => crate::organizer::preview(lib,body).await?,

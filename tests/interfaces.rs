@@ -184,6 +184,8 @@ fn http_accounts_confirmation_and_revocation() -> Result<()> {
     assert_eq!(chat(&admin)?["configured"], false);
     let config = json!({"provider":"ollama","base_url":"http://127.0.0.1:11333/v1","model":"chat:test","api_key":"fixture-secret"});
     assert_eq!(post("chat", &reader, config.clone())?.status(), 403);
+    assert_eq!(post("chat/test", &reader, config.clone())?.status(), 403);
+    assert_eq!(chat(&admin)?["api_type"], "auto");
     post("chat", &admin, config.clone())?.error_for_status()?;
     assert_eq!(chat(&admin)?["has_key"], true);
     assert!(!chat(&admin)?.to_string().contains("fixture-secret"));

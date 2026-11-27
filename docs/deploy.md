@@ -93,6 +93,7 @@ macOS 可用 `shasum -a 256 文件名` 核对摘要，再用 `chmod +x 文件名
 | `STARSTACK_OLLAMA_URL` | 兼容旧部署。显式设置后，尚未选择后端的资料库默认使用 Ollama，此地址优先于 `STARSTACK_OLLAMA_DEFAULT_URL`。 |
 | `STARSTACK_MODEL` | Ollama 的默认嵌入模型名，默认为 `qwen3-embedding:0.6b`。显式设置也会让尚未选择后端的资料库默认使用 Ollama。 |
 | `STARSTACK_AI_PROVIDER` | Aimux 对话服务商 ID，例如 `ollama` 或 `openai`。默认尚未配置。 |
+| `STARSTACK_AI_API_TYPE` | 选择 OpenAI 请求类型。可设 `auto`（沿用 Aimux 默认）、`responses` 或 `chat_completions`。 |
 | `STARSTACK_AI_MODEL` | 聊天服务上可用的具体模型名，例如本地 Ollama 的 `qwen3:4b`。 |
 | `STARSTACK_AI_BASE_URL` | 对话 API 基址。Ollama 需显式设置它（含 `/v1`），或设置 `STARSTACK_OLLAMA_URL` 并使用其 `/v1` 路径。 |
 | `STARSTACK_AI_API_KEY` | 远程对话服务所需的密钥。本地 Ollama 无需密钥。 |
@@ -169,6 +170,8 @@ STARSTACK_GITHUB_SCOPE=
 每位用户分别登录自己的 StarStack 账号，发起 GitHub 设备授权，按照页面显示的验证地址和一次性代码在 GitHub 确认。默认留空的 scope 可读取公开仓库。如果确实需要访问私有仓库，可以将 `STARSTACK_GITHUB_SCOPE` 改为 `repo` 并重新授权。GitHub 的经典 `repo` scope 包含私库读写等广泛权限。初始管理员可通过 `GITHUB_TOKEN` 提供 fine-grained PAT，以限制授权范围。创建令牌时，仅选择所需仓库，并授予只读权限。Stars 列表需要账户的 **Starring: Read-only**，读取私有仓库的 README 还需所选仓库的 **Contents: Read-only**。[GitHub 设备授权](https://docs.github.com/en/apps/oauth-apps/building-oauth-apps/authorizing-oauth-apps#device-flow) · [Stars API 权限](https://docs.github.com/en/rest/activity/starring#list-repositories-starred-by-the-authenticated-user)
 
 ### 使用 Aimux 问答
+
+OpenAI 或 OpenAI 兼容网关可在「同步与索引 → AI 聊天」选择 **OpenAI 请求类型**。基址填网关的 API 根路径，例如 `https://gateway.example.com/v1`。根据网关支持的接口选择 **Responses** 或 **Chat Completions**，再点击 **测试模型** 发起一次简短请求。测试使用当前表单配置，成功或失败都不会修改保存的设置。
 
 问答和 AI 整理默认尚未配置。管理员在后台配置 Aimux，或显式设置对话服务商、地址和模型。使用宿主机上的 Ollama 时，在宿主机执行 `ollama pull qwen3:4b`，Compose 的 `.env` 中填写 `STARSTACK_AI_PROVIDER=ollama`、`STARSTACK_AI_BASE_URL=http://host.docker.internal:11434/v1` 和 `STARSTACK_AI_MODEL=qwen3:4b`，再运行 `docker compose up -d`。检索模型由每个账号独立选择。选择 AI 问答时，StarStack 发送问题原文，以及当前账号筛选出的至多五个候选仓库的名称、摘要（最多 1024 个字符）、语言和来源编号。答案里的 `[1]` 等编号对应候选列表。私人标签、备注、README、GitHub 令牌和管理员凭据均不在对话请求中。
 

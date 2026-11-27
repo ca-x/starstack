@@ -39,7 +39,7 @@ Ask “What was that Rust parser I starred last year?” StarStack searches your
 
 Run `starstack serve` and open <http://127.0.0.1:8080/login>. Choose a username and password to create the first administrator. For unattended setup, set both `STARSTACK_ADMIN_USER` and `STARSTACK_ADMIN_PASSWORD` before the first launch.
 
-**Sync & index** has tabs for star sync, schedule and quotas, semantic indexing, the model market, and AI chat. The GitHub connection panel lets you reauthorize or disconnect. The AI chat form loads available models based on the selected provider, URL and API key.
+**Sync & index** has tabs for star sync, schedule and quotas, semantic indexing, the model market, and AI chat. The GitHub connection panel lets you reauthorize or disconnect. The AI chat form loads available models based on the selected provider, URL and API key. For an OpenAI-compatible gateway, choose Responses or Chat Completions and test the selected model before saving.
 
 For Docker, put the following variables in a local `.env` next to `compose.yaml`, replace the placeholders, then run `docker compose up -d --build`. The named volume keeps the library and model files across container recreation. The default published port binds to localhost. To download the search model inside the container, run `docker compose exec starstack starstack models download --source huggingface`.
 
