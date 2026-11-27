@@ -548,11 +548,13 @@ fn existing_ollama_projection_and_raw_vector_survive_an_incremental_upgrade() ->
     assert!(build(&mut db, false, &|_| {})?.contains("索引已是最新"));
     assert_eq!(generation(&mut db)?, 1);
     assert_eq!(fs::read(path)?, initial_file);
+    let (raw, reference) = embeddings::table
+        .find((&owner, item.id))
+        .select((embeddings::vector, embeddings::checksum))
+        .first::<(Vec<u8>, Vec<u8>)>(&mut db)?;
+    assert!(raw.is_empty());
     assert_eq!(
-        embeddings::table
-            .find((&owner, item.id))
-            .select(embeddings::vector)
-            .first::<Vec<u8>>(&mut db)?,
+        Payloads::new(home.path(), &owner).read(raw, &reference)?,
         blob
     );
 
@@ -639,17 +641,37 @@ fn rebuild_resumes_only_verified_checkpoints_after_interruption() -> Result<()> 
     }
     assert!(build(&mut db, true, &|_| {}).is_err());
     assert_eq!(generation(&mut db)?, 0);
+    let partial = serde_json::to_value(status::read(&mut db)?)?;
+    assert_eq!(partial["projection_bytes"], 0);
+    assert_eq!(partial["legacy_payload_bytes"], 0);
+    assert!(partial["vector_payload_bytes"].as_u64().unwrap_or_default() > 0);
+    assert_eq!(partial["checkpoints"], 16);
+
     assert_eq!(
         embedding_checkpoints::table
             .count()
             .get_result::<i64>(&mut db)?,
         16
     );
+    // Simulate upgrading a v0.2.6 account that stopped after its first SQLite checkpoint batch.
+    let legacy = vector_bytes(&[1.0, 0.0]);
+    diesel::update(embedding_checkpoints::table)
+        .set((
+            embedding_checkpoints::vector.eq(&legacy),
+            embedding_checkpoints::checksum.eq(Sha256::digest(&legacy).to_vec()),
+        ))
+        .execute(&mut db)?;
+    let owner = store::owner(&mut db)?;
+    let legacy_dir = home
+        .path()
+        .join(format!("vector-payloads-{:x}", Sha256::digest(&owner)));
+    fs::remove_dir_all(legacy_dir)?;
+    store::delete_meta(&mut db, "index_payload_storage")?;
     drop(db);
 
     let mut reopened = store::connect(home.path())?;
     assert!(pending_rebuild(&mut reopened)?);
-    // A modified document and a corrupted checkpoint must both be recomputed.
+    // A modified document and a corrupted legacy checkpoint must both be recomputed.
     store::upsert(&mut reopened, &repo(1, 2025, "changed", "Rust"))?;
     diesel::update(embedding_checkpoints::table.filter(embedding_checkpoints::id.eq(2)))
         .set(embedding_checkpoints::checksum.eq(vec![0]))
@@ -673,7 +695,8 @@ fn rebuild_resumes_only_verified_checkpoints_after_interruption() -> Result<()> 
     assert_eq!(status["state"], "ready");
     assert_eq!(status["indexed"], 20);
     assert!(status["projection_bytes"].as_u64().unwrap_or_default() > 0);
-    assert!(status["vector_bytes"].as_i64().unwrap_or_default() > 0);
+    assert!(status["vector_payload_bytes"].as_u64().unwrap_or_default() > 0);
+    assert_eq!(status["legacy_payload_bytes"], 0);
     assert!(status["last_published_at"].is_string());
 
     assert_eq!(

@@ -161,8 +161,8 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active
         <EuiButton type="submit" isDisabled={busy || jobActive || !available || !changed}>{t("使用此模型")}</EuiButton>
       </form>
       {catalog.backend === "builtin" && catalog.index_threads && <EuiFormRow label={t("索引挡位")}
-        helpText={t("控制内置模型建索引时的 CPU 线程数，下次任务生效。")} fullWidth>
-        <EuiSelect fullWidth value={catalog.index_profile} disabled={busy || jobActive}
+        helpText={t("控制内置模型的 CPU 线程数。索引运行中切换时，保存当前批次后会自动接续。")} fullWidth>
+        <EuiSelect fullWidth value={catalog.index_profile} disabled={busy}
           options={(Object.keys(profiles) as IndexProfile[]).map(value => ({
             value, text: t("{0} · {1} CPU 线程", t(profiles[value]), catalog.index_threads[value]),
           }))}

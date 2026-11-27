@@ -81,6 +81,8 @@ enum Command {
         data_dir: PathBuf,
         #[arg(long)]
         owner: String,
+        #[arg(long, value_enum)]
+        profile: index_worker::Profile,
     },
     /// 管理本机模型、下载来源与检索后端
     Models {
@@ -215,8 +217,13 @@ fn runtime() -> Result<tokio::runtime::Runtime> {
 }
 fn run() -> Result<()> {
     let cli = Cli::parse();
-    if let Command::IndexWorker { data_dir, owner } = &cli.command {
-        return index_worker::run(data_dir, owner);
+    if let Command::IndexWorker {
+        data_dir,
+        owner,
+        profile,
+    } = &cli.command
+    {
+        return index_worker::run(data_dir, owner, *profile);
     }
     let progress = progress_reporter();
     let lib = Library {

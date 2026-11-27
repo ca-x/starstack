@@ -1,5 +1,6 @@
 //! Built-in Candle and Ollama embeddings with an immutable, filtered HawDB cosine projection.
 pub(crate) mod mean;
+mod payloads;
 pub(crate) mod status;
 
 use std::cell::OnceCell;
@@ -21,6 +22,7 @@ use serde::Deserialize;
 use sha2::{Digest, Sha256};
 
 use crate::store::{self, Db, Filter, Repo};
+use payloads::Payloads;
 
 diesel::table! {
     embeddings (owner, id) {
@@ -260,6 +262,7 @@ struct Engine {
     selection: Selection,
     runtime: Runtime,
     managed: bool,
+    profile: Option<crate::index_worker::Profile>,
 }
 
 #[derive(Deserialize)]
@@ -290,6 +293,7 @@ impl Engine {
             selection,
             runtime,
             managed: true,
+            profile: None,
         })
     }
 
@@ -311,6 +315,16 @@ impl Engine {
         Ok(())
     }
 
+    fn check_profile(&self, db: &mut Db) -> Result<()> {
+        if let Some(profile) = self.profile {
+            ensure!(
+                crate::index_worker::Profile::load(db)? == profile,
+                crate::index_worker::ProfileChanged
+            );
+        }
+        Ok(())
+    }
+
     #[cfg(test)]
     fn fixture(url: &str, model: &str) -> Result<Self> {
         Ok(Self {
@@ -323,6 +337,7 @@ impl Engine {
             },
             runtime: Runtime::Ollama(Client::builder().no_proxy().build()?),
             managed: false,
+            profile: None,
         })
     }
 
@@ -518,6 +533,7 @@ type StoredVector = (i64, Vec<u8>, Vec<u8>, Vec<u8>);
 fn matching_vectors(
     rows: impl Iterator<Item = diesel::QueryResult<StoredVector>>,
     docs: &[Document],
+    payloads: &mut Payloads,
 ) -> Result<BTreeMap<i64, Vec<f32>>> {
     let mut vectors = BTreeMap::new();
     for row in rows {
@@ -526,8 +542,8 @@ fn matching_vectors(
             continue;
         };
         if hash == docs[idx].hash
-            && Sha256::digest(&blob)[..] == checksum
-            && let Ok(vector) = decode(&blob)
+            && let Ok(bytes) = payloads.read(blob, &checksum)
+            && let Ok(vector) = decode(&bytes)
         {
             vectors.insert(id, vector);
         }
@@ -539,6 +555,7 @@ fn cached_vectors(
     conn: &mut Db,
     owner: &str,
     docs: &[Document],
+    payloads: &mut Payloads,
 ) -> Result<BTreeMap<i64, Vec<f32>>> {
     use embeddings as t;
     matching_vectors(
@@ -547,6 +564,7 @@ fn cached_vectors(
             .select((t::id, t::fingerprint, t::vector, t::checksum))
             .load_iter::<StoredVector, _>(conn)?,
         docs,
+        payloads,
     )
 }
 
@@ -554,6 +572,7 @@ fn checkpoint_vectors(
     conn: &mut Db,
     owner: &str,
     docs: &[Document],
+    payloads: &mut Payloads,
 ) -> Result<BTreeMap<i64, Vec<f32>>> {
     use embedding_checkpoints as t;
     matching_vectors(
@@ -562,6 +581,7 @@ fn checkpoint_vectors(
             .select((t::id, t::fingerprint, t::vector, t::checksum))
             .load_iter::<StoredVector, _>(conn)?,
         docs,
+        payloads,
     )
 }
 
@@ -575,9 +595,64 @@ fn vector_bytes(vector: &[f32]) -> Vec<u8> {
     vector.iter().flat_map(|v| v.to_le_bytes()).collect()
 }
 
+fn migrate_payloads(db: &mut Db, owner: &str, payloads: &mut Payloads) -> Result<()> {
+    if store::meta(db, "index_payload_storage")?.is_some() {
+        return Ok(());
+    }
+    // Moving one bounded batch at a time lets existing searches keep using either format.
+    macro_rules! migrate {
+        ($table:ident) => {{
+            use $table as t;
+            while db.immediate_transaction::<_, anyhow::Error, _>(|db| {
+                let rows = t::table
+                    .filter(t::owner.eq(owner).and(t::vector.ne(Vec::<u8>::new())))
+                    .select((t::id, t::vector, t::checksum))
+                    .limit(128)
+                    .load::<(i64, Vec<u8>, Vec<u8>)>(db)?;
+                let moved = !rows.is_empty();
+                for (id, bytes, checksum) in rows {
+                    if Sha256::digest(&bytes)[..] == checksum && decode(&bytes).is_ok() {
+                        // HawDB publishes durably before SQLite changes the reference.
+                        let reference = payloads.write(&bytes)?;
+                        diesel::update(t::table.find((owner, id)))
+                            .set((t::vector.eq(Vec::<u8>::new()), t::checksum.eq(reference)))
+                            .execute(db)?;
+                    } else {
+                        diesel::delete(t::table.find((owner, id))).execute(db)?;
+                    }
+                }
+                Ok(moved)
+            })? {}
+        }};
+    }
+    migrate!(embeddings);
+    migrate!(embedding_checkpoints);
+    store::set_meta(db, "index_payload_storage", "hawdb-objects-v1")
+}
+
+fn collect_payloads(db: &mut Db, owner: &str, payloads: &mut Payloads) {
+    let result = db.immediate_transaction::<_, anyhow::Error, _>(|db| {
+        let published = embeddings::table
+            .filter(embeddings::owner.eq(owner))
+            .select(embeddings::checksum)
+            .load::<Vec<u8>>(db)?;
+        let pending = embedding_checkpoints::table
+            .filter(embedding_checkpoints::owner.eq(owner))
+            .select(embedding_checkpoints::checksum)
+            .load::<Vec<u8>>(db)?;
+        payloads.collect_orphans(published.into_iter().chain(pending))
+    });
+    if let Err(error) = result {
+        eprintln!("清理旧向量文件失败：{error}");
+    }
+}
+
 pub(crate) fn prepare_build(db: &mut Db, rebuild: bool) -> Result<bool> {
+    db.batch_execute(SCHEMA)?;
+    let owner = store::owner(db)?;
+    let data_dir = store::data_dir(db)?;
+    migrate_payloads(db, &owner, &mut Payloads::new(&data_dir, &owner))?;
     db.immediate_transaction(|db| {
-        db.batch_execute(SCHEMA)?;
         let identity = Selection::read(db)?.identity();
         let previous = store::meta(db, "index_rebuild")?;
         let pending_rebuild = previous.as_deref() == Some(identity.as_str());
@@ -644,8 +719,20 @@ pub(crate) fn build_observed(
     progress: &dyn Fn(&str),
     observe: &dyn Fn(Progress),
 ) -> Result<String> {
+    build_with_profile(conn, rebuild, None, progress, observe)
+}
+
+pub(crate) fn build_with_profile(
+    conn: &mut Db,
+    rebuild: bool,
+    profile: Option<crate::index_worker::Profile>,
+    progress: &dyn Fn(&str),
+    observe: &dyn Fn(Progress),
+) -> Result<String> {
     progress("正在检查索引模型和待处理仓库");
-    let engine = Engine::configured(conn, Duration::from_secs(180))?;
+    let mut engine = Engine::configured(conn, Duration::from_secs(180))?;
+    engine.profile = profile;
+    engine.check_profile(conn)?;
     engine.acquire()?;
     let dir = store::data_dir(conn)?;
     build_observed_with(conn, &dir, rebuild, &engine, progress, observe)
@@ -673,6 +760,8 @@ fn build_observed_with(
     let key = engine.selection.identity();
     let owner = store::owner(conn)?;
     conn.batch_execute(SCHEMA)?;
+    let mut payloads = Payloads::new(dir, &owner);
+    migrate_payloads(conn, &owner, &mut payloads)?;
     let (current, revision, docs, mut vectors, reuse_count, mut computed, existing_count) =
         conn.transaction::<_, anyhow::Error, _>(|db| {
             engine.check_current(db)?;
@@ -682,12 +771,12 @@ fn build_observed_with(
             let mut vectors = if rebuild || current == 0 {
                 BTreeMap::new()
             } else {
-                cached_vectors(db, &owner, &docs)
+                cached_vectors(db, &owner, &docs, &mut payloads)
                     .context("无法读取嵌入缓存，请运行 starstack index --rebuild")?
             };
             let reuse_count = vectors.len();
             let mut computed = std::collections::BTreeSet::new();
-            for (id, vector) in checkpoint_vectors(db, &owner, &docs)? {
+            for (id, vector) in checkpoint_vectors(db, &owner, &docs, &mut payloads)? {
                 if let std::collections::btree_map::Entry::Vacant(entry) = vectors.entry(id) {
                     computed.insert(id);
                     entry.insert(vector);
@@ -721,6 +810,7 @@ fn build_observed_with(
             );
             finish_index(db, &owner, &revision, rebuild)
         })?;
+        collect_payloads(conn, &owner, &mut payloads);
         observe(Progress {
             repositories: 0,
             total: 0,
@@ -777,13 +867,14 @@ fn build_observed_with(
                     use embedding_checkpoints as t;
                     for (doc, vector) in &completed {
                         let bytes = vector_bytes(vector);
+                        let reference = payloads.write(&bytes)?;
                         diesel::replace_into(t::table)
                             .values((
                                 t::owner.eq(&owner),
                                 t::id.eq(doc.id),
                                 t::fingerprint.eq(&doc.hash),
-                                t::vector.eq(&bytes),
-                                t::checksum.eq(Sha256::digest(&bytes).to_vec()),
+                                t::vector.eq(Vec::<u8>::new()),
+                                t::checksum.eq(reference),
                             ))
                             .execute(db)?;
                     }
@@ -800,7 +891,7 @@ fn build_observed_with(
             observe(counts);
             batch.clear();
             finished.clear();
-            Ok(())
+            engine.check_profile(db)
         };
         for (idx, doc) in group.iter().enumerate() {
             let repo = match store::by_id(conn, doc.id) {
@@ -861,7 +952,7 @@ fn build_observed_with(
     writer.finish()?;
     // Publish into the inactive slot before committing its generation in SQLite. A failed
     // write or crash leaves the previously committed projection and its matching cache intact.
-    conn.immediate_transaction(|db| {
+    let report = conn.immediate_transaction::<_, anyhow::Error, _>(|db| {
         engine.check_current(db)?;
         ensure!(build_generation(db, rebuild)? == current, BuildConflict);
         ensure!(library_revision(db)? == revision, BuildConflict);
@@ -893,8 +984,8 @@ fn build_observed_with(
                     embeddings::owner.eq(&owner),
                     embeddings::id.eq(doc.id),
                     embeddings::fingerprint.eq(&doc.hash),
-                    embeddings::vector.eq(&bytes),
-                    embeddings::checksum.eq(Sha256::digest(&bytes).to_vec()),
+                    embeddings::vector.eq(Vec::<u8>::new()),
+                    embeddings::checksum.eq(Payloads::reference_bytes(&bytes)),
                 ))
                 .execute(db)?;
         }
@@ -920,7 +1011,9 @@ fn build_observed_with(
             missing.len(),
             docs.len() - missing.len()
         ))
-    })
+    })?;
+    collect_payloads(conn, &owner, &mut payloads);
+    Ok(report)
 }
 
 fn finish_index(db: &mut Db, owner: &str, revision: &str, rebuild: bool) -> Result<()> {
@@ -1113,6 +1206,7 @@ fn search_with(
                 && (filter.list.is_none() || store::meta(db, "lists_revision")? == lists_revision),
             "查询期间收藏资料已更新，请重试查询"
         );
+        let mut payloads = Payloads::new(dir, &owner);
         let mut ranked = Vec::with_capacity(candidates.hits.len());
         for hit in candidates.hits {
             let id = i64::try_from(hit.id)?;
@@ -1120,10 +1214,9 @@ fn search_with(
                 .find((&owner, id))
                 .select((embeddings::vector, embeddings::checksum))
                 .first::<(Vec<u8>, Vec<u8>)>(db)?;
-            ensure!(
-                Sha256::digest(&bytes)[..] == checksum,
-                "向量校验失败，请运行 starstack index 修复"
-            );
+            let bytes = payloads
+                .read(bytes, &checksum)
+                .context("无法读取原始向量，请运行 starstack index 修复")?;
             let stored = decode(&bytes)?;
             ensure!(
                 vector.len() == stored.len(),

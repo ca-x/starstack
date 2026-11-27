@@ -1,5 +1,5 @@
 //! A read-only inventory of the current account's published index and saved work.
-use super::{artifact_path, generation, library_revision};
+use super::{Payloads, artifact_path, generation, library_revision};
 use crate::store::{self, Db, repositories};
 use anyhow::Result;
 use diesel::{prelude::*, sql_types};
@@ -22,8 +22,8 @@ pub(crate) struct Status {
     indexed: i64,
     checkpoints: i64,
     projection_bytes: u64,
-    vector_bytes: i64,
-    checkpoint_bytes: i64,
+    vector_payload_bytes: u64,
+    legacy_payload_bytes: i64,
     last_published_at: Option<String>,
 }
 
@@ -80,7 +80,7 @@ pub(crate) fn read(db: &mut Db) -> Result<Status> {
         let has_embeddings = table_exists(db, "embeddings")?;
         let vectors = if has_embeddings {
             diesel::sql_query(
-                "SELECT COUNT(r.id) AS active, COALESCE(SUM(length(e.vector) + length(e.fingerprint) + length(e.checksum)), 0) AS bytes
+                "SELECT COUNT(r.id) AS active, COALESCE(SUM(length(e.vector)), 0) AS bytes
                  FROM embeddings e LEFT JOIN repositories r ON e.owner=r.owner_id AND e.id=r.id AND r.active=1
                  WHERE e.owner = ?",
             )
@@ -91,7 +91,7 @@ pub(crate) fn read(db: &mut Db) -> Result<Status> {
         };
         let checkpoint = if table_exists(db, "embedding_checkpoints")? {
             diesel::sql_query(
-                "SELECT COUNT(r.id) AS active, COALESCE(SUM(length(c.vector) + length(c.fingerprint) + length(c.checksum)), 0) AS bytes
+                "SELECT COUNT(r.id) AS active, COALESCE(SUM(length(c.vector)), 0) AS bytes
                  FROM embedding_checkpoints c LEFT JOIN repositories r ON c.owner=r.owner_id AND c.id=r.id AND r.active=1
                  WHERE c.owner = ?",
             )
@@ -127,8 +127,8 @@ pub(crate) fn read(db: &mut Db) -> Result<Status> {
             indexed: if published { vectors.active } else { 0 },
             checkpoints: checkpoint.active,
             projection_bytes,
-            vector_bytes: vectors.bytes,
-            checkpoint_bytes: checkpoint.bytes,
+            vector_payload_bytes: Payloads::new(&dir, &owner).disk_bytes()?,
+            legacy_payload_bytes: vectors.bytes + checkpoint.bytes,
             last_published_at,
         })
     })

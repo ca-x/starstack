@@ -1,6 +1,6 @@
 [package]
 name = "starstack"
-version = "0.2.6"
+version = "0.2.7"
 edition = "2024"
 rust-version = "1.97.1"
 license = "Apache-2.0"
@@ -43,6 +43,9 @@ tokio = { version = "1", features = ["rt-multi-thread", "macros", "net", "signal
 tower = { version = "0.5", features = ["util"] }
 uuid = { version = "1", features = ["v4"] }
 backoff = "0.4.0"
+# HawDB 0.40 qualifies the Zstd 1.5.7 ABI. Keep the matching zstd dependencies in Cargo.lock.
+hawdb-storage = "=0.40.0"
+hawdb-integrity = "=0.40.0"
 
 [profile.release]
 strip = true

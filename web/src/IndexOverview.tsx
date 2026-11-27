@@ -11,8 +11,8 @@ interface Inventory {
   indexed: number;
   checkpoints: number;
   projection_bytes: number;
-  vector_bytes: number;
-  checkpoint_bytes: number;
+  vector_payload_bytes: number;
+  legacy_payload_bytes: number;
   last_published_at: string | null;
 }
 
@@ -60,14 +60,16 @@ export function IndexOverview({ visible, working, attention, modelBytes }: {
       <dl className="index-overview-facts">
         <div><dt>{t("最近更新索引")}</dt><dd>{inventory.last_published_at ? date(inventory.last_published_at, true) : t("尚未发布")}</dd></div>
         <div><dt>{t("已保存断点")}</dt><dd>{numbers.format(inventory.checkpoints)}</dd></div>
-        <div><dt>{t("索引数据占用")}</dt><dd>{formatBytes(inventory.projection_bytes + inventory.vector_bytes + inventory.checkpoint_bytes)}</dd></div>
+        <div><dt>{t("索引数据占用")}</dt><dd>{formatBytes(inventory.projection_bytes + inventory.vector_payload_bytes + inventory.legacy_payload_bytes)}</dd></div>
         {modelBytes !== undefined && <div><dt>{t("当前模型文件")}</dt><dd>{formatBytes(modelBytes)}</dd></div>}
       </dl>
+      {!inventory.last_published_at && inventory.checkpoints > 0 &&
+        <p>{t("已计算的向量已保存，可断点接续。首版索引发布后即可进行语义检索。")}</p>}
       <details className="index-storage-details"><summary>{t("查看索引占用明细")}</summary>
         <dl className="index-overview-facts">
-          <div><dt>HawDB</dt><dd>{formatBytes(inventory.projection_bytes)}</dd></div>
-          <div><dt>{t("SQLite 向量数据")}</dt><dd>{formatBytes(inventory.vector_bytes)}</dd></div>
-          <div><dt>{t("SQLite 断点数据")}</dt><dd>{formatBytes(inventory.checkpoint_bytes)}</dd></div>
+          <div><dt>{t("HawDB 检索索引")}</dt><dd>{inventory.projection_bytes > 0 ? formatBytes(inventory.projection_bytes) : t("尚未发布")}</dd></div>
+          <div><dt>{t("HawDB 原始向量与断点")}</dt><dd>{formatBytes(inventory.vector_payload_bytes)}</dd></div>
+          {inventory.legacy_payload_bytes > 0 && <div><dt>{t("待迁移的旧版向量")}</dt><dd>{formatBytes(inventory.legacy_payload_bytes)}</dd></div>}
         </dl>
       </details>
     </>}

@@ -1093,7 +1093,10 @@ async fn schedule(app: Shared) {
                             let needs_first_index = store::meta(db, "index_generation")?
                                 .is_none_or(|value| value == "0")
                                 && store::has_active_repositories(db)?;
-                            if pending || needs_first_index {
+                            let needs_payload_migration = store::meta(db, "index_generation")?
+                                .is_some_and(|value| value != "0")
+                                && store::meta(db, "index_payload_storage")?.is_none();
+                            if pending || needs_first_index || needs_payload_migration {
                                 return Ok(Some("index"));
                             }
                         }
