@@ -21,7 +21,7 @@
    starstack models download --source huggingface
    ```
 
-3. **连接自己的 GitHub。** 本机已登录 GitHub CLI 时，运行 **`starstack auth login --gh`** 即可。星栈仅记录凭证来源，在同步时向本机 `gh` 读取当前账号的凭证。已有个人 token 也可设 `GITHUB_TOKEN`。使用设备码时，设置你自己的 GitHub OAuth App 的 Client ID，然后在浏览器输入星栈显示的短码。如果服务器需要代理，可先设置环境变量 `STARSTACK_PROXY_URL`，支持 HTTP 和 SOCKS5；输入短码可使用另一台能访问 GitHub 的设备。访问公开收藏可保持默认的空 scope。App 注册和 Compose 参数见[设备授权设置](docs/deploy.md)。
+3. **连接自己的 GitHub。** 本机已登录 GitHub CLI 时，运行 **`starstack auth login --gh`** 即可。星栈仅记录凭证来源，在同步时向本机 `gh` 读取当前账号的凭证。已有个人 token 也可设 `GITHUB_TOKEN`。使用设备码时，设置你自己的 GitHub OAuth App 的 Client ID，然后在浏览器输入星栈显示的短码。如果服务器需要代理，可先设置环境变量 `STARSTACK_PROXY_URL`，支持 HTTP 和 SOCKS5；输入短码可使用另一台能访问 GitHub 的设备。访问公开收藏可保持默认的空 scope。GitHub 注册表单里的 Redirect URI 可填写同一个 Homepage URL。完整选项和 Compose 参数见[设备授权设置](docs/deploy.md#配置-github-设备授权)。
 
    ```bash
    export STARSTACK_GITHUB_CLIENT_ID='你的 OAuth App Client ID'

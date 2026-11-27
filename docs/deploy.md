@@ -156,8 +156,9 @@ REST 分页支持 gzip 传输。一次无凭据的公开样本中，100 条 Star
 
 ### 配置 GitHub 设备授权
 
-1. 登录 GitHub，在 **Settings → Developer settings → OAuth Apps** 选择 **New OAuth App**。填写应用名称和 StarStack 的主页 URL。GitHub 注册表单要求填写 Authorization callback URL，可以填写同一主页地址。Device Flow 使用设备代码完成授权。
-2. 注册后进入该 OAuth App 的设置，勾选 **Enable Device Flow** 并保存。复制页面上的 **Client ID**。[GitHub OAuth App 设置](https://github.com/settings/developers)
+1. 在 GitHub 的 **Settings → Developer settings → OAuth Apps** 选择 **New OAuth App**。填写应用名称与 **Homepage URL**，例如 `https://github.com/ca-x/starstack`。**Redirect URI**（旧版表单称为 **Authorization callback URL**）填同一个主页地址。星栈会通过设备码轮询授权结果，无需部署回调路径。
+2. 取消勾选 **Allow wildcard matching**，勾选 **Enable Device Flow**。如果有 **Expire user access tokens**，建议取消勾选。星栈目前尚未实现自动续期，令牌过期后需要重新授权。
+3. 注册后复制 **Client ID**。懒猫用户将它填入应用配置「GitHub 设备授权客户端 ID」。Compose 用户按下方设置。两种部署方式都只需要 Client ID。[GitHub OAuth App 设置](https://github.com/settings/developers)
 3. 将下面两行加入 Compose 的 `.env` 文件，把第一行的占位符换成自己的 Client ID。已启动的实例运行 `docker compose up -d` 加载配置。
 
 ```dotenv
