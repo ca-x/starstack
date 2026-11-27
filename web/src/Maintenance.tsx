@@ -1,4 +1,4 @@
-import { getLocale, t } from "./locale";
+import { getLocale, jobText, t } from "./locale";
 import { useEffect, useState } from "react";
 import { EuiButton, EuiButtonEmpty, EuiConfirmModal, EuiTab, EuiTabs } from "@elastic/eui";
 import { api, date, message, type Stats } from "./api";
@@ -106,6 +106,7 @@ export function Maintenance({ stats, admin, job, progress, indexProgress, catalo
   stats: Stats; admin: boolean; job: Job | null; progress: string; indexProgress?: IndexProgress; catalogReport?: JobReport; report: JobReport | undefined; error: string; run: (job: Job, full: boolean, requestId?: string) => Promise<void>;
 }) {
   const [active, setActive] = useState<(typeof tabs)[number][0]>("sync");
+  const [modelNoticeTarget, setModelNoticeTarget] = useState<HTMLDivElement | null>(null);
   function openTab(id: "market" | "index") {
     setActive(id);
     document.getElementById(`maintenance-tab-${id}`)?.focus();
@@ -113,6 +114,7 @@ export function Maintenance({ stats, admin, job, progress, indexProgress, catalo
   const number = new Intl.NumberFormat(getLocale());
   return <>
     <div className="page-heading"><div><h1>{t("同步与索引")}</h1><p>{t("连接 GitHub、更新收藏并维护本地语义索引。")}</p></div></div>
+    <div ref={setModelNoticeTarget} />
     {progress && <div className={`job-notice${report?.warnings.length ? " job-notice--warning" : ""}`}>
       <div role="status"><strong>{progress}</strong>{report?.warnings.map((warning, i) => <p key={i}>{t(warning)}</p>)}</div>
       {indexProgress && <div className="index-job-progress">
@@ -126,7 +128,7 @@ export function Maintenance({ stats, admin, job, progress, indexProgress, catalo
         </dl>
       </div>}
       {catalogReport && catalogReport.message !== report?.message && (
-        <details><summary>{t(catalogReport.message)}</summary>
+        <details><summary>{jobText(catalogReport.message)}</summary>
           {[...catalogReport.warnings, ...catalogReport.details].map((entry, i) => <p key={i}>{t(entry)}</p>)}
         </details>
       )}
@@ -154,7 +156,7 @@ export function Maintenance({ stats, admin, job, progress, indexProgress, catalo
         <div className="row-controls"><EuiButton fill isDisabled={!!job} onClick={() => run("sync", false)}>{t("增量同步")}</EuiButton>
           <EuiButton isDisabled={!!job} onClick={() => run("sync", true)}>{t("全量同步")}</EuiButton></div></section>
     </div>
-    <EmbeddingModels active={active} openMarket={() => openTab("market")} openIndex={() => openTab("index")} admin={admin} jobActive={!!job} index={rebuild => run("index", rebuild)} fallbackModel={stats.model} />
+    <EmbeddingModels active={active} noticeTarget={modelNoticeTarget} openMarket={() => openTab("market")} openIndex={() => openTab("index")} admin={admin} jobActive={!!job} index={rebuild => run("index", rebuild)} fallbackModel={stats.model} />
     <div className="operations" hidden={active !== "chat"} role="tabpanel" id="maintenance-panel-chat" aria-labelledby="maintenance-tab-chat">
       <ChatSettings admin={admin} active={active === "chat"} />
     </div>

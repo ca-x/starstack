@@ -553,6 +553,23 @@ const english: Record<string, string> = {
   "GitHub 来源": "GitHub source"
 };
 
+const jobMessages: [RegExp, string][] = [
+  [/^正在写入 (\d+) 个仓库的 HawDB 索引$/, "Writing the index · {0} total"],
+  [/^索引已更新，共 (\d+) 个仓库，新计算 (\d+) 个，复用 (\d+) 个$/, "Index updated · {0} total · {1} calculated · {2} reused"],
+  [/^索引已是最新，共 (\d+) 个仓库$/, "Index is current · {0} total"],
+  [/^新增 (\d+)，更新 (\d+)，取消收藏 (\d+)，无需变更 (\d+)$/, "{0} added · {1} updated · {2} removed · {3} unchanged"],
+];
+
+export function jobText(text: string): string {
+  if (language === "en") {
+    for (const [pattern, translation] of jobMessages) {
+      const match = pattern.exec(text);
+      if (match) return translation.replace(/\{(\d+)\}/g, (_, i: string) => match[Number(i) + 1]);
+    }
+  }
+  return t(text);
+}
+
 export function t(key: string, ...values: (string | number)[]): string {
   const text = language === "en" ? english[key] ?? key : key;
   return text.replace(/\{(\d+)\}/g, (placeholder, i: string) => String(values[Number(i)] ?? placeholder));

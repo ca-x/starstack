@@ -1,4 +1,4 @@
-import { t } from "./locale";
+import { jobText, t } from "./locale";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { EuiButtonEmpty } from "@elastic/eui";
@@ -83,14 +83,14 @@ function Admin() {
         setIndexProgress(result.index_progress ?? undefined);
         setCatalogReport(result.catalog_report ?? undefined);
         if (busy.current) {
-          if (result.message) setProgress(t(result.message));
+          if (result.message) setProgress(jobText(result.message));
           setJobReport(result.report ?? undefined);
           interval = 900;
         } else if (typeof result.running === "boolean") {
           setExternalRunning(result.running);
           setJobReport(result.report ?? undefined);
           if (result.running) { setJobError(""); interval = 900; }
-          if (result.message && (result.running || result.report || !jobError)) setProgress(t(result.message));
+          if (result.message && (result.running || result.report || !jobError)) setProgress(jobText(result.message));
           if (previouslyRunning && !result.running) refresh();
           previouslyRunning = result.running;
         }
@@ -111,7 +111,7 @@ function Admin() {
       const result = await api<JobReport>(next, input);
       if (next === "readmes") setExternalRunning(true);
       else setJobReport(result);
-      setProgress(t(result.message || (next === "readmes" ? "已提交 README 补全任务。" : "操作已完成。")));
+      setProgress(jobText(result.message || (next === "readmes" ? "已提交 README 补全任务。" : "操作已完成。")));
     } catch (e) { setJobError(message(e)); setProgress(""); }
     finally { busy.current = false; setJob(null); refresh(); }
   }

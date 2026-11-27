@@ -1,4 +1,5 @@
 import { useEffect, useState, type FormEvent } from "react";
+import { createPortal } from "react-dom";
 import { EuiButton, EuiButtonGroup, EuiFieldText, EuiFormRow, EuiSelect, EuiTextArea } from "@elastic/eui";
 import { api, message } from "./api";
 import { read, t, write } from "./locale";
@@ -29,8 +30,8 @@ function approvedUrl(raw: string) {
   } catch { return false; }
 }
 
-export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active, openMarket, openIndex }: {
-  active: string; openMarket: () => void; openIndex: () => void; admin: boolean; jobActive: boolean; index: (rebuild: boolean) => Promise<void>; fallbackModel: string;
+export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active, openMarket, openIndex, noticeTarget }: {
+  active: string; noticeTarget: HTMLDivElement | null; openMarket: () => void; openIndex: () => void; admin: boolean; jobActive: boolean; index: (rebuild: boolean) => Promise<void>; fallbackModel: string;
 }) {
   const [catalog, setCatalog] = useState<Catalog>();
   const [draft, setDraft] = useState<string>();
@@ -123,11 +124,11 @@ export function EmbeddingModels({ admin, jobActive, index, fallbackModel, active
       : catalog?.needs_rebuild ? t("当前账号的索引需要重建。") : "";
   const viewMarket = missingActiveFile && admin;
   return <>
-    {modelIssue && <section className="job-notice job-notice--warning model-index-notice" aria-label={t("语义索引需要处理")}>
+    {modelIssue && noticeTarget && createPortal(<section className="job-notice job-notice--warning model-index-notice" aria-label={t("语义索引需要处理")}>
       <div role="status"><strong>{t("语义索引需要处理")}</strong><p>{modelIssue}</p></div>
       {viewMarket ? <EuiButton size="s" onClick={openMarket}>{t("打开模型市场")}</EuiButton>
         : active !== "index" && <EuiButton size="s" onClick={openIndex}>{t("查看索引设置")}</EuiButton>}
-    </section>}
+    </section>, noticeTarget)}
     <div className="operations" hidden={active !== "index"} role="tabpanel" id="maintenance-panel-index" aria-labelledby="maintenance-tab-index">
     <section className="operation"><div><h2>{t("语义索引")}</h2>
     <p>{t("为新增或变更的仓库建立索引。更换模型后可重建全部索引。")}</p></div>
