@@ -360,3 +360,10 @@ body .workspace[tabindex="-1"]:focus { outline: none !important; }
 .repo-commit-list li { border-top: 1px solid var(--rule); padding: 8px 0; overflow-wrap: anywhere; }
 .repo-commit-list small { color: var(--muted); margin-left: 8px; }
 .repo-commit-list p { white-space: pre-wrap; }
+
+.home-tags { margin-bottom: 18px; }
+.home-tags > .row-controls { justify-content: space-between; }
+
+.retry-settings { width: 100%; margin: 0; padding: 10px 12px 12px; border: 1px solid var(--rule); border-radius: 8px; min-width: 0; }
+.retry-settings legend { padding: 0 5px; font-weight: 650; }
+.retry-settings .row-controls { gap: 10px 22px; margin-top: 10px; }

@@ -107,6 +107,8 @@ starstack export --format json --output stars.json
 
 把仓库名替换为自己的收藏。列表和详情会立即显示修改。下次检索会自动补齐变化的批注向量，也可用 `starstack index` 提前更新。导出的文件包含私人批注，请在分享前核对。[Markdown 示例](examples/collection.md) · [JSON 示例](examples/collection.json)
 
+在「同步与索引 → 计划与额度」可分别开关收藏同步、README 补全和 AI 自动整理的失败重试。临时失败会指数退避，最多补试五次，并遵循服务端要求的等待时间。同步与 README 的重试受各自的定时设置约束。AI 整理从已保存的进度继续，认证错误需要手动处理。
+
 ## AI 与 MCP
 
 MCP 默认使用当前账号的 Embedding 索引。在「MCP 接入 → 检索与推荐」开启 AI 后，星栈会先补充查询关键词，再根据召回结果生成建议。[MCP 工具说明](docs/mcp.md)

@@ -50,6 +50,8 @@ struct Job {
     error: Option<String>,
     #[serde(default)]
     pause_requested: bool,
+    #[serde(default)]
+    retry: Option<crate::retry::Pending>,
 }
 impl Default for Job {
     fn default() -> Self {
@@ -61,6 +63,7 @@ impl Default for Job {
             added: 0,
             error: None,
             pause_requested: false,
+            retry: None,
         }
     }
 }
@@ -156,10 +159,15 @@ pub(crate) fn progress(db: &mut Db) -> Result<Value> {
 pub(crate) fn pause(db: &mut Db) -> Result<Value> {
     db.immediate_transaction(|db| {
         let mut job = state(db)?;
-        if job.status == "running" {
-            job.pause_requested = true;
-            save(db, &job)?
+        match job.status.as_str() {
+            "running" => job.pause_requested = true,
+            "retry_wait" => {
+                job.status = "paused".into();
+                job.retry = None;
+            }
+            _ => return Ok(json!({"message":"已请求暂停"})),
         }
+        save(db, &job)?;
         Ok(json!({"message":"已请求暂停"}))
     })
 }
@@ -189,28 +197,93 @@ pub(crate) async fn start(lib: Library, input: Option<Value>) -> Result<Value> {
             }
             job.status = "running".into();
             job.error = None;
+            job.retry = None;
             job.pause_requested = false;
             save(db, &job)
         })
     })
     .await?;
+    launch(lib, lease);
+    Ok(json!({"message":"自动整理已启动"}))
+}
+
+pub(crate) fn disable_retry(db: &mut Db) -> Result<()> {
+    let mut job = state(db)?;
+    if job.status == "retry_wait" {
+        job.status = "paused".into();
+        job.retry = None;
+        save(db, &job)?;
+    }
+    Ok(())
+}
+
+pub(crate) async fn resume_due(lib: Library) -> Result<()> {
+    let Some(lease) = lib
+        .run(|db| {
+            db.immediate_transaction(|db| {
+                let mut job = state(db)?;
+                if job.status != "retry_wait"
+                    || !crate::retry::enabled(db, "organize")?
+                    || job
+                        .retry
+                        .is_none_or(|retry| retry.next_at > chrono::Utc::now().timestamp())
+                {
+                    return Ok(None);
+                }
+                let Some(lease) = lock(&store::data_dir(db)?, &store::owner(db)?)? else {
+                    return Ok(None);
+                };
+                job.status = "running".into();
+                job.error = None;
+                save(db, &job)?;
+                Ok(Some(lease))
+            })
+        })
+        .await?
+    else {
+        return Ok(());
+    };
+    launch(lib, lease);
+    Ok(())
+}
+
+fn launch(lib: Library, lease: File) {
     tokio::spawn(async move {
         let _lease = lease;
         if let Err(error) = run(&lib).await {
+            let minimum = crate::retry::minimum(&error);
             let message = format!("{error:#}");
-            let _ = lib
+            let saved = lib
                 .run(move |db| {
                     db.immediate_transaction(|db| {
                         let mut job = state(db)?;
-                        job.status = "failed".into();
+                        let enabled = crate::retry::enabled(db, "organize")?;
+                        job.retry = minimum
+                            .filter(|_| enabled && !job.pause_requested)
+                            .and_then(|after| {
+                                job.retry
+                                    .unwrap_or_default()
+                                    .after_failure(chrono::Utc::now().timestamp(), after)
+                            });
+                        job.status = if job.pause_requested {
+                            "paused"
+                        } else if job.retry.is_some() {
+                            "retry_wait"
+                        } else {
+                            "failed"
+                        }
+                        .into();
+                        job.pause_requested = false;
                         job.error = Some(message);
                         save(db, &job)
                     })
                 })
                 .await;
+            if let Err(error) = saved {
+                eprintln!("保存自动整理重试状态失败：{error}");
+            }
         }
     });
-    Ok(json!({"message":"自动整理已启动"}))
 }
 fn proceed(db: &mut Db) -> Result<bool> {
     let mut job = state(db)?;
@@ -226,6 +299,7 @@ fn proceed(db: &mut Db) -> Result<bool> {
 fn advance(db: &mut Db, added: usize) -> Result<()> {
     let mut job = state(db)?;
     job.processed += 1;
+    job.retry = None;
     job.added += added;
     save(db, &job)
 }
@@ -258,6 +332,7 @@ async fn run(lib: &Library) -> Result<()> {
                 .run(|db| {
                     let mut j = state(db)?;
                     j.status = "done".into();
+                    j.retry = None;
                     save(db, &j)?;
                     store::delete_meta(db, "organize_ids")
                 })

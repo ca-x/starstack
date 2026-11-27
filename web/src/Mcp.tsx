@@ -1,6 +1,6 @@
 import { t } from "./locale";
 import { useEffect, useState, type FormEvent } from "react";
-import { EuiButton, EuiButtonEmpty, EuiFieldText, EuiFormRow, EuiSwitch } from "@elastic/eui";
+import { EuiButton, EuiButtonEmpty, EuiCopy, EuiFieldText, EuiFormRow, EuiSwitch } from "@elastic/eui";
 import { api, date, message } from "./api";
 import { Failure } from "./shared";
 
@@ -33,7 +33,13 @@ function ModelPreference() {
   </section>;
 }
 
+function CopyButton({ text, label }: { text: string; label: string }) {
+  return <EuiCopy textToCopy={text} afterMessage={t("已复制")}>{copy =>
+    <EuiButtonEmpty size="s" iconType="copy" onClick={copy}>{label}</EuiButtonEmpty>}</EuiCopy>;
+}
+
 export function Mcp() {
+  const endpoint = location.origin + "/mcp";
   const [tokens, setTokens] = useState<Token[]>([]);
   const [name, setName] = useState("");
   const [secret, setSecret] = useState("");
@@ -74,13 +80,15 @@ export function Mcp() {
   return <>
     <div className="page-heading"><div><h1>{t("MCP 接入")}</h1><p>{t("在支持 Streamable HTTP 的 MCP 客户端中访问收藏。")}</p></div></div>
     <div className="operations">
-      <section className="operation"><h2>{t("连接地址")}</h2><code className="endpoint">{location.origin}/mcp</code>
+      <section className="operation"><h2>{t("连接地址")}</h2><div className="row-controls"><code className="endpoint">{endpoint}</code>
+        <CopyButton text={endpoint} label={t("复制地址")} /></div>
         <p>{t("在客户端设置请求头")}<code>{t("Authorization: Bearer <令牌>")}</code></p></section>
       <ModelPreference />
       <section className="operation"><h2>{t("访问令牌")}</h2>
         {secret ? <div className="token-secret"><EuiFormRow label={t("新令牌")} helpText={t("完整令牌仅在这里显示一次，请复制并妥善保存。")} fullWidth>
           <EuiFieldText fullWidth value={secret} readOnly onFocus={e => e.target.select()} /></EuiFormRow>
-          <EuiButton size="s" onClick={() => setSecret("")}>{t("已保存，隐藏令牌")}</EuiButton></div> :
+          <div className="row-controls"><CopyButton text={secret} label={t("复制令牌")} />
+          <EuiButton size="s" onClick={() => setSecret("")}>{t("已保存，隐藏令牌")}</EuiButton></div></div> :
           <form className="create-token" onSubmit={create}><EuiFormRow label={t("令牌名称")}><EuiFieldText required value={name} onChange={e => setName(e.target.value)} placeholder={t("例如「桌面客户端」")} /></EuiFormRow>
             <EuiButton fill type="submit" isDisabled={!name.trim()} isLoading={busy}>{t("生成令牌")}</EuiButton></form>}
         {error && <Failure error={error} />}{status && <p role="status">{status}</p>}

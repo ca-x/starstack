@@ -33,9 +33,21 @@ pub(crate) struct Summary {
     readme_pause: Option<String>,
     failure_examples: Vec<String>,
     retry_after_seconds: Option<u64>,
+    #[serde(skip)]
+    retry_minimum: Option<Duration>,
 }
 
 impl Summary {
+    fn remember_retry(&mut self, error: &anyhow::Error) {
+        if let Some(delay) = retry_minimum(error) {
+            self.retry_minimum = Some(self.retry_minimum.unwrap_or_default().max(delay));
+        }
+    }
+
+    pub(crate) fn retry_minimum(&self) -> Option<Duration> {
+        self.retry_minimum
+    }
+
     fn record_failure(&mut self, message: String, progress: &dyn Fn(&str)) {
         self.failed += 1;
         self.record_example(message, progress);
@@ -43,6 +55,7 @@ impl Summary {
 
     fn readme_failed(&mut self, name: &str, error: &anyhow::Error, progress: &dyn Fn(&str)) {
         self.readme_failures += 1;
+        self.remember_retry(error);
         self.record_example(format!("{name} 的 README 待重试（{error}）"), progress);
     }
 
@@ -225,6 +238,13 @@ impl fmt::Display for RateLimit {
 
 impl std::error::Error for RateLimit {}
 
+pub(crate) fn retry_minimum(error: &anyhow::Error) -> Option<Duration> {
+    error
+        .downcast_ref::<RateLimit>()
+        .map(|e| e.delay)
+        .or_else(|| crate::retry::minimum(error))
+}
+
 struct GitHub<'a> {
     client: Client,
     token: &'a str,
@@ -347,10 +367,11 @@ impl Requests<'_> {
                         ) {
                             return Err(RateLimit { delay }.into());
                         }
-                        bail!(
-                            "GitHub 请求 {path} 返回 {status}，{suggestion}（{} 秒后）",
-                            delay.as_secs()
-                        )
+                        return Err(crate::retry::Transient {
+                            message: format!("GitHub 请求 {path} 返回 {status}，{suggestion}"),
+                            after: delay,
+                        }
+                        .into());
                     }
                     delay
                 }
@@ -591,6 +612,7 @@ fn fetch_catalog(
             Ok(response) => response,
             Err(error) => {
                 consecutive_failures += 1;
+                summary.remember_retry(&error);
                 summary.retry_after_seconds =
                     error.downcast_ref::<RateLimit>().map(|r| r.delay.as_secs());
                 summary
@@ -753,6 +775,7 @@ fn enrich_queue(
                     fetched.push(repo);
                 }
                 Err(error) if error.is::<RateLimit>() || error.is::<DeferredReadme>() => {
+                    summary.remember_retry(&error);
                     if let Some(limit) = error.downcast_ref::<RateLimit>() {
                         summary.retry_after_seconds = Some(limit.delay.as_secs());
                     }

@@ -19,6 +19,7 @@ mod proxy;
 mod quota;
 mod repo_code;
 mod repo_commits;
+mod retry;
 mod store;
 mod sync;
 #[cfg(test)]

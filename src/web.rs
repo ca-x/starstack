@@ -39,6 +39,8 @@ struct JobReport {
     message: String,
     warnings: Vec<String>,
     details: Vec<String>,
+    #[serde(skip)]
+    transient_delay: Option<Duration>,
 }
 impl JobReport {
     fn from_sync(summary: &crate::sync::Summary, catalog: bool) -> Self {
@@ -47,6 +49,7 @@ impl JobReport {
             message,
             warnings,
             details,
+            transient_delay: summary.retry_minimum(),
         }
     }
     fn add_step(&mut self, result: Result<String>, label: &str) {
@@ -386,6 +389,9 @@ struct Settings {
     quota_reserve_percent: Option<u8>,
     readme_budget: Option<usize>,
     readme_source: Option<crate::quota::ReadmeSource>,
+    retry_sync: Option<bool>,
+    retry_readme: Option<bool>,
+    retry_organize: Option<bool>,
 }
 fn value<T: serde::de::DeserializeOwned>(v: Value) -> Result<T> {
     serde_json::from_value(v).context("参数格式有误")
@@ -472,6 +478,10 @@ fn settings(db: &mut store::Db) -> Result<Value> {
     Ok(json!({"sync_interval_minutes":library::interval(db)?,
         "readme_interval_minutes":quota::readme_interval(db)?,"pending_sync":store::meta(db,"pending_sync")?,
         "quota_reserve_percent":p.reserve_percent,"readme_budget":p.readme_budget,"readme_source":p.readme_source,
+        "retry_sync":crate::retry::enabled(db,"sync")?,
+        "retry_readme":crate::retry::enabled(db,"readme")?,
+        "retry_organize":crate::retry::enabled(db,"organize")?,
+        "retry_pending":{"sync":crate::retry::pending(db,"sync")?, "readme":crate::retry::pending(db,"readme")?},
         "firecrawl_available":cfg!(feature="firecrawl-local"), "pending_readmes":quota::pending(db)?,
         "quotas":{"rest":Window::load(db,Resource::Rest)?,"graphql":Window::load(db,Resource::Graphql)?}}))
 }
@@ -494,6 +504,7 @@ fn start_job(
 }
 async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Result<JobReport> {
     let catalog = operation == "sync";
+    let task = operation.clone();
     let state = app.clone();
     let user = lib.user.clone();
     let result = lib
@@ -537,27 +548,68 @@ async fn work(app: Shared, lib: Library, operation: String, input: Run) -> Resul
             }
         })
         .await;
+    let minimum = match &result {
+        Ok(report) => report.transient_delay,
+        Err(error) => crate::sync::retry_minimum(error),
+    };
+    let next = if matches!(task.as_str(), "sync" | "readme") {
+        lib.run(move |db| {
+            db.immediate_transaction(|db| {
+                let now = chrono::Utc::now().timestamp();
+                let interval = if task == "sync" {
+                    library::interval(db)?
+                } else {
+                    crate::quota::readme_interval(db)?
+                };
+                let next = if interval > 0 && crate::retry::enabled(db, &task)? {
+                    let previous = crate::retry::pending(db, &task)?.unwrap_or_default();
+                    minimum.and_then(|delay| previous.after_failure(now, delay))
+                } else {
+                    None
+                };
+                crate::retry::store_pending(db, &task, next)?;
+                Ok(next)
+            })
+        })
+        .await
+    } else {
+        Ok(None)
+    };
+    if let Err(error) = &next {
+        eprintln!("保存后台任务重试状态失败：{error}");
+    }
     {
         let mut jobs = app.jobs.lock().expect("jobs lock poisoned");
         let item = jobs.entry(lib.user.clone()).or_default();
         item.running = false;
-        let report = match &result {
+        let mut report = match &result {
             Ok(report) => report.clone(),
             Err(error) => JobReport {
                 message: "任务未完成".into(),
                 warnings: vec![error.to_string()],
                 details: error.chain().skip(1).map(ToString::to_string).collect(),
+                transient_delay: None,
             },
         };
+        if let Ok(Some(next)) = &next {
+            let time = chrono::DateTime::from_timestamp(next.next_at, 0)
+                .map_or_else(|| "GitHub 恢复后".into(), |date| date.to_rfc3339());
+            report.warnings.push(format!("计划在 {time} 自动重试。"));
+        }
         item.message.clone_from(&report.message);
         item.report = Some(report);
     }
-    if catalog && result.is_ok() {
+    if catalog
+        && result
+            .as_ref()
+            .is_ok_and(|report| report.transient_delay.is_none())
+    {
         let enrich = lib
             .run(|db| {
                 Ok(crate::quota::readme_interval(db)? > 0
                     && crate::quota::Policy::load(db)?.readme_budget > 0
-                    && crate::quota::pending(db)? > 0)
+                    && crate::quota::pending(db)? > 0
+                    && crate::retry::pending(db, "readme")?.is_none())
             })
             .await?;
         // The next stage is independent of the browser connection.
@@ -778,6 +830,12 @@ async fn write(
                 if let Some(n)=q.readme_budget{p.readme_budget=n;}
                 if let Some(source)=q.readme_source{p.readme_source=source;}
                 p.save(db)?;
+                for (task, enabled) in [("sync",q.retry_sync),("readme",q.retry_readme),("organize",q.retry_organize)] {
+                    if let Some(enabled)=enabled {
+                        crate::retry::configure(db,task,enabled)?;
+                        if task=="organize" && !enabled { crate::organizer::disable_retry(db)?; }
+                    }
+                }
                 settings(db)
             })).await?
         }
@@ -962,6 +1020,9 @@ async fn schedule(app: Shared) {
         let users = app.base.run(auth::users).await.unwrap_or_default();
         for a in users.into_iter().filter(|a| !a.disabled) {
             let lib = tenant(&app, &a.id);
+            if let Err(error) = crate::organizer::resume_due(lib.clone()).await {
+                eprintln!("恢复自动整理任务失败：{error}");
+            }
             if app
                 .jobs
                 .lock()
@@ -983,23 +1044,29 @@ async fn schedule(app: Shared) {
                                 .and_then(|v| v.parse().ok())
                                 .unwrap_or(0))
                         };
+                        let due =
+                            |db: &mut store::Db, task: &str, ordinary: bool| -> Result<bool> {
+                                Ok(crate::retry::pending(db, task)?
+                                    .map_or(ordinary, |retry| now >= retry.next_at))
+                            };
                         let every = library::interval(db)?;
                         let full = store::meta(db, "last_full_sync")?
                             .and_then(|v| v.parse::<chrono::DateTime<chrono::Utc>>().ok())
                             .map_or(0, |v| v.timestamp());
                         let rest = crate::quota::Window::load(db, crate::quota::Resource::Rest)?;
-                        if every > 0
-                            && now - last(db, "last_scheduled")?.max(full) >= (every * 60) as i64
-                            && rest.check().is_ok()
-                        {
+                        let sync_due =
+                            now - last(db, "last_scheduled")?.max(full) >= (every * 60) as i64;
+                        if every > 0 && due(db, "sync", sync_due)? && rest.check().is_ok() {
                             store::set_meta(db, "last_scheduled", &now.to_string())?;
                             return Ok(Some("sync"));
                         }
                         let policy = crate::quota::Policy::load(db)?;
                         let interval = crate::quota::readme_interval(db)?;
+                        let readme_due =
+                            now - last(db, "last_readme_attempt")? >= (interval * 60) as i64;
                         if interval > 0
                             && policy.readme_budget > 0
-                            && now - last(db, "last_readme_attempt")? >= (interval * 60) as i64
+                            && due(db, "readme", readme_due)?
                             && rest.check().is_ok()
                             && (policy.readme_source == crate::quota::ReadmeSource::Firecrawl
                                 || rest.has_headroom(policy.reserve_percent))
@@ -1025,7 +1092,7 @@ async fn schedule(app: Shared) {
                 );
             }
         }
-        tokio::time::sleep(Duration::from_secs(60)).await;
+        tokio::time::sleep(Duration::from_secs(15)).await;
     }
 }
 pub(crate) async fn serve(base: Library, bind: SocketAddr) -> Result<()> {

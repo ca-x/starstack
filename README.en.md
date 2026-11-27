@@ -55,6 +55,8 @@ Admins can create, disable or delete other accounts, reset their passwords and c
 
 In a repository’s detail panel, generate a summary draft, edit it, and save it locally. Ask follow-up questions about the code and review the source paths cited in each answer. Code Q&A sends selected source and README excerpts to the configured chat provider. Saved summaries are indexed, and you can choose which code excerpts to keep in the index. For regression investigation, opt in to commit tracking on individual repositories. Fetch 20 commits by default or choose all available default-branch history. Previously observed SHA records are kept when a baseline check detects a rewrite. The latest 100 commit messages are included in semantic search.
 
+In **Sync & index → Schedule & quotas**, choose whether star sync, README enrichment, and AI auto-organization retry after temporary failures. StarStack uses exponential backoff for up to five retries and honors server retry delays. Star and README retries follow their schedule settings. AI organization resumes from saved progress. Authentication errors require attention.
+
 ### Built-in and remote search models
 
 Under **Sync & index → Model market**, an administrator can download the shared model files from Hugging Face or ModelScope, monitor progress, retry a download or remove an unused model. Operators can point either source at a trusted mirror with `STARSTACK_HF_ENDPOINT` or `STARSTACK_MODELSCOPE_ENDPOINT`. StarStack checks each file against the pinned model revision.

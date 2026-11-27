@@ -1,6 +1,6 @@
 import { getLocale, t } from "./locale";
 import { useEffect, useRef, useState, type FormEvent } from "react";
-import { EuiButton, EuiFieldNumber, EuiFormRow, EuiSelect } from "@elastic/eui";
+import { EuiButton, EuiFieldNumber, EuiFormRow, EuiSelect, EuiSwitch } from "@elastic/eui";
 import { api, message, request } from "./api";
 import { Failure } from "./shared";
 
@@ -11,7 +11,13 @@ interface Quota {
   blocked_until: number | null;
 }
 type ReadmeSource = "github" | "firecrawl";
-interface Settings {
+const retryTasks = [
+  ["retry_sync", "收藏同步"], ["retry_readme", "README 补全"], ["retry_organize", "AI 自动整理"],
+] as const;
+type RetryKey = typeof retryTasks[number][0];
+interface PendingRetry { next_at: number; attempts: number }
+interface Settings extends Partial<Record<RetryKey, boolean>> {
+  retry_pending?: { sync?: PendingRetry | null; readme?: PendingRetry | null };
   readme_source?: ReadmeSource;
   firecrawl_available?: boolean;
   sync_interval_minutes: number;
@@ -65,6 +71,7 @@ function Quotas({ settings, jobActive, fetchReadmes }: { settings: Settings; job
 export function Schedule({ jobActive, confirm, fetchReadmes }: { jobActive: boolean; fetchReadmes: () => void; confirm: (id: string) => Promise<void> }) {
   const [settings, setSettings] = useState<Settings>();
   const [draft, setDraft] = useState<Partial<Record<SettingKey, string>>>({});
+  const [retryDraft, setRetryDraft] = useState<Partial<Record<RetryKey, boolean>>>({});
   const [draftSource, setDraftSource] = useState<ReadmeSource>();
   const [busy, setBusy] = useState(false);
   const [saved, setSaved] = useState(false);
@@ -97,7 +104,10 @@ export function Schedule({ jobActive, confirm, fetchReadmes }: { jobActive: bool
     readme_interval_minutes: settings?.readme_interval_minutes ?? 30,
   };
   const source = settings?.readme_source ?? "github";
-  const patch: Partial<Record<SettingKey, number>> & { readme_source?: ReadmeSource } = {};
+  const patch: Partial<Record<SettingKey, number>> & Partial<Record<RetryKey, boolean>> & { readme_source?: ReadmeSource } = {};
+  for (const [key] of retryTasks) {
+    if (retryDraft[key] !== undefined && retryDraft[key] !== (settings?.[key] ?? true)) patch[key] = retryDraft[key];
+  }
   if (draftSource && draftSource !== source) patch.readme_source = draftSource;
   let valid = patch.readme_source !== "firecrawl" || settings?.firecrawl_available === true;
   for (const { key, max } of fields) {
@@ -117,6 +127,7 @@ export function Schedule({ jobActive, confirm, fetchReadmes }: { jobActive: bool
       saveVersion.current++;
       setSettings(current => current && ({ ...current, ...patch }));
       setDraft({});
+      setRetryDraft({});
       setDraftSource(undefined);
       setSaved(true);
       setRevision(n => n + 1);
@@ -154,6 +165,16 @@ export function Schedule({ jobActive, confirm, fetchReadmes }: { jobActive: bool
               }} />
           </EuiFormRow>
         </div>
+        <fieldset className="retry-settings"><legend>{t("失败后自动重试")}</legend>
+          <p>{t("临时失败会延迟重试，最多五次。GitHub 或模型服务要求等待更久时，会遵循服务端的等待时间。")}</p>
+          <div className="row-controls">{retryTasks.map(([key,label]) => <EuiSwitch key={key} label={t(label)}
+            checked={retryDraft[key] ?? settings?.[key] ?? true} disabled={!settings || busy}
+            onChange={event => { setRetryDraft(draft => ({ ...draft, [key]: event.target.checked })); setSaved(false); }} />)}</div>
+          {(["sync", "readme"] as const).map(task => {
+            const next = settings?.retry_pending?.[task];
+            return next && <p key={task} role="status">{t("{0}将于 {1} 之后自动重试。", t(task === "sync" ? "收藏同步" : "README 补全"), utcTime(next.next_at))}</p>;
+          })}
+        </fieldset>
         <EuiButton type="submit" isDisabled={!settings || !changed || !valid} isLoading={busy}>{t("保存设置")}</EuiButton>
       </form>
       {error && <Failure error={error} retry={!settings ? () => { setError(""); setRevision(n => n + 1); } : undefined} />}

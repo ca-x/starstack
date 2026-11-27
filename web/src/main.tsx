@@ -3,7 +3,7 @@ import { useCallback, useEffect, useRef, useState } from "react";
 import { createRoot } from "react-dom/client";
 import { EuiButtonEmpty } from "@elastic/eui";
 import { Preferences, PreferenceMenu } from "./Preferences";
-import { api, counts, message, request, type Stats } from "./api";
+import { api, message, request, type Stats } from "./api";
 import { Library } from "./Library";
 import { Login } from "./Login";
 import { Mcp } from "./Mcp";
@@ -19,7 +19,6 @@ import statsIcon from "./icons/stack-stats.svg?no-inline";
 import syncIcon from "./icons/stack-sync.svg?no-inline";
 import usersIcon from "./icons/stack-users.svg?no-inline";
 import mcpIcon from "./icons/stack-key.svg?no-inline";
-import tagIcon from "./icons/stack-tag.svg?no-inline";
 import "./styles.css";
 
 const tagLink = (tag: string) => "#tag/" + encodeURIComponent(tag);
@@ -131,14 +130,13 @@ function Admin() {
       <div className="profile-menu"><PreferenceMenu /><ProfileButton profile={profile} changed={setProfile} /><EuiButtonEmpty size="s" aria-label={t("退出登录")} title={t("退出登录")} isDisabled={loggingOut} iconType="logOut" onClick={logout}><span className="signout-label">{t("退出登录")}</span></EuiButtonEmpty></div></header>
     <aside id="navigation" className={mobileNav ? "rail is-open" : "rail"}><nav aria-label={t("主导航")}>
       <span className="nav-label">{t("工作区")}</span><div className="nav-group">{navigation().map(([href, name, icon]) => navItem(href, name, icon, href === "#library" ? stats.total : undefined))}{profile.admin && navItem("#users", t("用户管理"), usersIcon)}</div>
-      {Object.keys(stats.tags).length > 0 && <><span className="nav-label">{t("我的标签")}</span><div className="nav-group">{counts(stats.tags).map(([name, n]) => navItem(tagLink(name), name, tagIcon, n))}</div></>}
     </nav></aside>
     <main id="main" className={`workspace${["#sync", "#users", "#mcp"].includes(route) ? " workspace--settings" : ""}`} tabIndex={-1} ref={main}>
       {statsError && <Failure error={statsError} retry={refresh} />}{logoutError && <Failure error={logoutError} />}
       {job && route !== "#sync" && <a href="#sync" className="progress-note">{progress || t("查看任务进度")} <Icon type="arrowRight" /></a>}
       {route === "#sync" ? <Maintenance stats={stats} admin={profile.admin} job={job || (externalRunning ? "sync" : null)} progress={progress} report={jobReport} error={jobError} run={run} /> :
         route === "#users" && profile.admin ? <Users username={profile.username} /> : route === "#mcp" ? <Mcp /> : route === "#statistics" ? <Statistics stats={stats} tagLink={tagLink} /> :
-        <Library key={route} stats={stats} initial={{ pinned: route === "#pinned" || undefined, tag }} revision={revision} onEdit={refresh} onSync={() => { location.hash = "sync"; }} />}
+        <Library key={route} stats={stats} tagLink={tagLink} initial={{ pinned: route === "#pinned" || undefined, tag }} revision={revision} onEdit={refresh} onSync={() => { location.hash = "sync"; }} />}
     </main>
   </div>;
 }

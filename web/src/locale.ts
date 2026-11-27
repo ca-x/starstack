@@ -526,6 +526,18 @@ const english: Record<string, string> = {
   "聊天服务在 30 秒内未返回结果。请重试，或检查网关与上游模型的响应时间。": "The chat service did not return a result within 30 seconds. Try again or check the gateway and upstream latency.",
   "上游 ModelScope 要求完成邮箱验证（HTTP 403）。请在 ModelScope 完成验证，或选择其他模型。": "The upstream ModelScope account needs email verification (HTTP 403). Verify it in ModelScope or choose a different model.",
   "聊天服务响应超时，请重试或选择响应更快的模型": "The chat request timed out. Try again or choose a faster model.",
+  "失败后自动重试": "Retry after failure",
+  "临时失败会延迟重试，最多五次。GitHub 或模型服务要求等待更久时，会遵循服务端的等待时间。": "Temporary failures are retried up to five times with a delay. A longer delay requested by GitHub or the model provider takes precedence.",
+  "README 补全": "README enrichment",
+  "AI 自动整理": "AI auto-organization",
+  "等待自动重试": "Waiting to retry",
+  "将在 {0} 之后进行第 {1} 次自动重试。": "Retry {1} will run after {0}.",
+  "{0}将于 {1} 之后自动重试。": "{0} will retry after {1}.",
+  "复制地址": "Copy address",
+  "复制令牌": "Copy token",
+  "已复制": "Copied",
+  "收起标签": "Show fewer tags",
+  "查看全部标签": "Show all tags",
   "GitHub 来源": "GitHub source"
 };
 

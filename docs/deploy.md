@@ -155,6 +155,8 @@ REST 分页支持 gzip 传输。一次无凭据的公开样本中，100 条 Star
 
 每个账号可在 **同步与索引 → 计划与额度** 分别调整收藏同步和 README 后台补全间隔，调整其中一项不会更改另一项。
 
+在「同步与索引 → 计划与额度」可分别开关收藏同步、README 补全和 AI 自动整理的失败重试。临时失败会指数退避，最多补试五次，并遵循服务端要求的等待时间。同步与 README 的重试受各自的定时设置约束。AI 整理从已保存的进度继续，认证错误需要手动处理。
+
 ### 配置 GitHub 设备授权
 
 1. 在 GitHub 的 **Settings → Developer settings → OAuth Apps** 选择 **New OAuth App**。填写应用名称与 **Homepage URL**，例如 `https://github.com/ca-x/starstack`。**Redirect URI**（旧版表单称为 **Authorization callback URL**）填同一个主页地址。星栈会通过设备码轮询授权结果，无需部署回调路径。

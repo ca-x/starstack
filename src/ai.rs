@@ -92,7 +92,13 @@ impl ChatModel {
             .await
             .map_err(generation_error)?;
         let text = result.text();
-        ensure!(!text.trim().is_empty(), "聊天服务返回了空回答");
+        if text.trim().is_empty() {
+            return Err(crate::retry::Transient {
+                message: "聊天服务返回了空回答".into(),
+                after: std::time::Duration::ZERO,
+            }
+            .into());
+        }
         Ok(text.trim().to_owned())
     }
 }
@@ -111,12 +117,16 @@ fn generation_error(error: AiMuxError) -> anyhow::Error {
             );
         }
         if detail.status_code.is_none() && detail.message.contains("exchange response timeout") {
-            return anyhow::anyhow!(
-                "聊天服务在 30 秒内未返回结果。请重试，或检查网关与上游模型的响应时间。"
-            );
+            return crate::retry::Transient {
+                message: "聊天服务在 30 秒内未返回结果。请重试，或检查网关与上游模型的响应时间。"
+                    .into(),
+                after: std::time::Duration::ZERO,
+            }
+            .into();
         }
     }
-    let message = match error.status_code() {
+    let status = error.status_code();
+    let message = match status {
         Some(400 | 404 | 405 | 422) => "请检查 API 基址、请求类型及模型名称",
         Some(401 | 403) => "请检查网关密钥及上游模型的授权",
         Some(429) => "请求已达限额，请稍后重试或检查上游额度",
@@ -126,11 +136,22 @@ fn generation_error(error: AiMuxError) -> anyhow::Error {
         }
         _ => "无法调用聊天服务，请检查网络、服务地址和所选请求类型",
     };
-    if let Some(status) = error.status_code() {
-        anyhow::anyhow!("聊天服务返回 HTTP {status}。{message}。")
-    } else {
-        anyhow::anyhow!("{message}。")
+    let message = status.map_or_else(
+        || format!("{message}。"),
+        |code| format!("聊天服务返回 HTTP {code}。{message}。"),
+    );
+    if matches!(status, Some(408 | 429 | 500..=599))
+        || status.is_none() && (error.is_retryable() || matches!(error, AiMuxError::Timeout { .. }))
+    {
+        return crate::retry::Transient {
+            message,
+            after: std::time::Duration::from_millis(
+                error.retry_after_hint().unwrap_or(0).max(0) as u64
+            ),
+        }
+        .into();
     }
+    anyhow::anyhow!(message)
 }
 
 pub(crate) async fn test_connection(cfg: Config) -> Result<()> {
@@ -255,8 +276,10 @@ pub(crate) async fn classify(
         tags: Vec<String>,
         reason: String,
     }
-    let answers: Vec<Answer> = serde_json::from_str(raw)
-        .context("聊天模型返回的分类格式无效，可重试或切换支持 JSON 的聊天模型")?;
+    let answers: Vec<Answer> = serde_json::from_str(raw).map_err(|_| crate::retry::Transient {
+        message: "聊天模型返回的分类格式无效，可重试或切换支持 JSON 的聊天模型".into(),
+        after: std::time::Duration::ZERO,
+    })?;
     let mut result = BTreeMap::new();
     for answer in answers {
         let Some(repo) = batch.repos.iter().find(|r| r.id == answer.id) else {

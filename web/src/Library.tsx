@@ -2,6 +2,7 @@ import { languageName, t } from "./locale";
 import { useEffect, useRef, useState, type FormEvent } from "react";
 import { EuiButton, EuiButtonEmpty, EuiFieldText, EuiSelect } from "@elastic/eui";
 import { api, date, message, request, type Filters, type Repo, type Sort, type Stats } from "./api";
+import { TagCloud } from "./TagCloud";
 import { Organize } from "./Organize";
 import { Detail } from "./Detail";
 import { FilterPanel } from "./Filters";
@@ -34,8 +35,8 @@ function RepoRow({ repo, open, source }: { repo: Repo; open: () => void; source?
   </li>;
 }
 
-export function Library({ stats, initial, revision, onEdit, onSync }: {
-  stats: Stats; initial: Filters; revision: number; onEdit: () => void; onSync: () => void;
+export function Library({ stats, initial, revision, onEdit, onSync, tagLink }: {
+  stats: Stats; initial: Filters; revision: number; onEdit: () => void; onSync: () => void; tagLink: (tag: string) => string;
 }) {
   const [filters, setFilters] = useState(initial);
   const [sort, setSort] = useState<Sort>("time");
@@ -132,6 +133,8 @@ export function Library({ stats, initial, revision, onEdit, onSync }: {
       </div>
       {showFilters && <div id="filter-panel"><FilterPanel initial={filters} stats={stats} fixedTag={initial.tag} apply={next => { setFilters(next); setPage(0); setShowFilters(false); }} /></div>}
     </section>
+    {!initial.pinned && !initial.tag && !query && Object.keys(stats.tags).length > 0 &&
+      <TagCloud values={stats.tags} tagLink={tagLink} compact />}
     {answer && <section className="ai-answer"><h2>{t("推荐结果")}</h2><p>{answer}</p></section>}
     <section className="collection" aria-labelledby="results-heading">
       <div className="result-head"><h2 id="results-heading">{query ? (mode === "ask" ? t("引用仓库") : t("相关仓库")) : t("仓库列表")}
