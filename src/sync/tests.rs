@@ -669,7 +669,7 @@ fn only_the_current_owners_identity_response_can_mark_a_github_credential_reject
     }
     current.store(200, Ordering::SeqCst);
     // The catalog request fails after a valid /user response.
-    let _ = sync(&mut db);
+    assert_eq!(sync(&mut db)?.failed, 1);
     assert_eq!(state(&mut db)?["rejected"], false);
     current.store(401, Ordering::SeqCst);
     assert!(sync(&mut db).is_err());
