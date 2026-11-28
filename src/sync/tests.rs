@@ -617,3 +617,63 @@ fn boost_respects_zero_budget_and_separate_graphql_reserve() -> Result<()> {
     assert_eq!(Window::load(&mut db, Resource::Graphql)?.remaining, Some(5));
     Ok(())
 }
+
+#[test]
+fn only_the_current_owners_identity_response_can_mark_a_github_credential_rejected() -> Result<()> {
+    use crate::auth::{github_status, save_github_token};
+    let home = tempfile::tempdir()?;
+    let mut db = store::connect_as(home.path(), "reader")?;
+    let mut other = store::connect_as(home.path(), "second-reader")?;
+    save_github_token(&mut db, "  fixture-bearer  ", None)?;
+    save_github_token(&mut other, "fixture-bearer", None)?;
+    let state = |db: &mut Db| -> Result<serde_json::Value> {
+        Ok(serde_json::to_value(github_status(db)?)?)
+    };
+    let current = Arc::new(AtomicUsize::new(401));
+    let response = current.clone();
+    let server = Server::new(move |request| {
+        assert!(
+            request
+                .headers
+                .contains("authorization: bearer fixture-bearer")
+        );
+        if request.target == "/user" {
+            let status = response.load(Ordering::SeqCst);
+            if status == 200 {
+                Reply::json(json!({"id":42}))
+            } else if status == 201 {
+                Reply::json(json!({}))
+            } else {
+                Reply::status(status as u16)
+            }
+        } else {
+            Reply::status(401)
+        }
+    });
+    let gh = GitHub {
+        client: Client::builder().no_proxy().build()?,
+        token: "fixture-bearer",
+        base: &server.url,
+    };
+    let sync = |db: &mut Db| synchronize(db, true, Mode::Catalog, &gh, &|_| {});
+    assert!(sync(&mut db).unwrap_err().to_string().contains("401"));
+    assert_eq!(state(&mut db)?, json!({"source":"device","rejected":true}));
+    assert_eq!(
+        state(&mut other)?,
+        json!({"source":"device","rejected":false})
+    );
+    for inconclusive in [403, 201] {
+        current.store(inconclusive, Ordering::SeqCst);
+        assert!(sync(&mut db).is_err());
+        assert_eq!(state(&mut db)?["rejected"], true);
+    }
+    current.store(200, Ordering::SeqCst);
+    // The catalog request fails after a valid /user response.
+    let _ = sync(&mut db);
+    assert_eq!(state(&mut db)?["rejected"], false);
+    current.store(401, Ordering::SeqCst);
+    assert!(sync(&mut db).is_err());
+    save_github_token(&mut db, "replacement", None)?;
+    assert_eq!(state(&mut db)?["rejected"], false);
+    Ok(())
+}

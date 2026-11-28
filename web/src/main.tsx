@@ -133,7 +133,7 @@ function Admin() {
     <main id="main" className={`workspace${(maintenance || ["#users", "#mcp", "#connections"].includes(route)) ? " workspace--settings" : ""}`} tabIndex={-1} ref={main}>
       {statsError && <Failure error={statsError} retry={refresh} />}{logoutError && <Failure error={logoutError} />}
       {maintenance ? <Maintenance key={route} initialTab={route === "#sync/index" ? "index" : "sync"}
-        stats={stats} admin={profile.admin} job={job} stages={stages} error={jobError} run={run} /> :
+        stats={stats} revision={revision} admin={profile.admin} job={job} stages={stages} error={jobError} run={run} /> :
         route === "#connections" ? <Connections admin={profile.admin} /> : route === "#users" && profile.admin ? <Users username={profile.username} /> : route === "#mcp" ? <Mcp /> : route === "#statistics" ? <Statistics stats={stats} tagLink={tagLink} /> :
         <Library key={route} stats={stats} tagLink={tagLink} initial={{ pinned: route === "#pinned" || undefined, tag }} revision={revision} onEdit={refresh} onSync={() => { location.hash = "sync"; }} />}
     </main>

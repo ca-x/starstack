@@ -445,7 +445,7 @@ async fn read(
             "nickname":store::meta(db,"nickname")?
         }))).await?,
         "mcp/settings" => lib.run(|db| Ok(json!({"use_chat":crate::mcp::chat_enabled(db)?}))).await?,
-        "github" => lib.run(|db| Ok(json!({"source": auth::github_source(db)?}))).await?,
+        "github" => lib.run(|db| Ok(json!(auth::github_status(db)?))).await?,
         "chat" => lib.run(move|db|crate::chat_settings::status(db,a.admin)).await?,
         "stats" => lib.run(|db| Ok(json!(store::stats(db)?))).await?,
         "tokens" => lib.run(|db| Ok(json!({"tokens": auth::tokens(db)?}))).await?,
@@ -996,11 +996,7 @@ async fn write(
                     result => {
                         devices.remove(&a.id);
                         let token=result?.context("设备授权无效，请重新开始")?;
-                        db.immediate_transaction(|db| {
-                            let current=auth::account(db,&a.id)?;
-                            ensure!(!current.disabled && current.revision==a.revision, "设备授权无效，请重新开始");
-                            auth::save_github_token(db,&token)
-                        })?;
+                        auth::save_github_token(db,&token,Some(a.revision))?;
                         Ok(json!({"status":"complete","interval":interval}))
                     }
                 }
@@ -1231,3 +1227,6 @@ pub(crate) async fn serve(base: Library, bind: SocketAddr) -> Result<()> {
     .await?;
     Ok(())
 }
+
+#[cfg(test)]
+mod tests;

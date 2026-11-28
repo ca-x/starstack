@@ -186,13 +186,11 @@ pub(crate) fn delete(db: &mut Db, actor: &Account, username: &str) -> Result<()>
         diesel::delete(access_tokens::table.filter(access_tokens::owner_id.eq(&user.id)))
             .execute(db)?;
         use store::metadata_values as m;
-        diesel::delete(
-            m::table.filter(
-                m::owner_id
-                    .eq(&user.id)
-                    .and(m::key.eq_any(["github_token", "github_source"])),
-            ),
-        )
+        diesel::delete(m::table.filter(m::owner_id.eq(&user.id).and(m::key.eq_any([
+            "github_token",
+            "github_source",
+            GITHUB_IDENTITY_PROBE,
+        ]))))
         .execute(db)?;
         diesel::delete(a::table.find(user.id)).execute(db)?;
         Ok(())
@@ -349,7 +347,8 @@ pub(crate) fn use_gh(db: &mut Db) -> Result<()> {
     gh_token()?;
     db.immediate_transaction(|db| {
         store::set_meta(db, "github_source", "gh")?;
-        store::delete_meta(db, "github_token")
+        store::delete_meta(db, "github_token")?;
+        store::delete_meta(db, GITHUB_IDENTITY_PROBE)
     })
 }
 pub(crate) fn github_source(db: &mut Db) -> Result<Option<&'static str>> {
@@ -363,6 +362,94 @@ pub(crate) fn github_source(db: &mut Db) -> Result<Option<&'static str>> {
     }
     Ok(store::meta(db, "github_token")?.map(|_| "device"))
 }
+const GITHUB_IDENTITY_PROBE: &str = "github_identity_probe";
+
+#[derive(Serialize)]
+pub(crate) struct GitHubStatus {
+    source: Option<&'static str>,
+    rejected: bool,
+}
+
+pub(crate) fn github_status(db: &mut Db) -> Result<GitHubStatus> {
+    db.transaction(|db| {
+        let source = github_source(db)?;
+        let probe = GitHubIdentityProbe::load(db)?;
+        let rejected = if let Some(probe) = probe.filter(|probe| probe.rejected) {
+            matches_credential(db, source, &probe.fingerprint)?
+        } else {
+            false
+        };
+        Ok(GitHubStatus { source, rejected })
+    })
+}
+
+fn matches_credential(db: &mut Db, source: Option<&str>, fingerprint: &str) -> Result<bool> {
+    let token = match source {
+        Some("gh") => gh_token().ok(),
+        Some("environment") => environment_token(),
+        Some("device") => store::meta(db, "github_token")?,
+        _ => None,
+    };
+    Ok(token.is_some_and(|token| digest(token.trim()) == fingerprint))
+}
+
+// One row per owner. The request ID also orders overlapping checks of the same token.
+#[derive(Serialize, Deserialize)]
+pub(super) struct GitHubIdentityProbe {
+    fingerprint: String,
+    request: String,
+    rejected: bool,
+}
+
+impl GitHubIdentityProbe {
+    fn load(db: &mut Db) -> Result<Option<Self>> {
+        Ok(store::meta(db, GITHUB_IDENTITY_PROBE)?
+            .map(|raw| serde_json::from_str(&raw))
+            .transpose()?)
+    }
+
+    fn save(&self, db: &mut Db) -> Result<()> {
+        store::set_meta(db, GITHUB_IDENTITY_PROBE, &serde_json::to_string(self)?)
+    }
+
+    pub fn start(db: &mut Db, token: &str) -> Result<Self> {
+        db.immediate_transaction(|db| {
+            let mut probe = Self {
+                fingerprint: digest(token.trim()),
+                request: Uuid::new_v4().to_string(),
+                rejected: false,
+            };
+            if let Some(previous) = Self::load(db)? {
+                if previous.fingerprint == probe.fingerprint {
+                    probe.rejected = previous.rejected;
+                } else {
+                    // A client can capture a token before another sync starts. Supersede
+                    // a different credential's check only if this one is still selected.
+                    let source = github_source(db)?;
+                    if !matches_credential(db, source, &probe.fingerprint)? {
+                        return Ok(probe);
+                    }
+                }
+            }
+            probe.save(db)?;
+            Ok(probe)
+        })
+    }
+
+    pub fn finish(mut self, db: &mut Db, rejected: bool) -> Result<()> {
+        if self.rejected == rejected {
+            return Ok(());
+        }
+        db.immediate_transaction(|db| {
+            if Self::load(db)?.is_some_and(|current| current.request == self.request) {
+                self.rejected = rejected;
+                self.save(db)?;
+            }
+            Ok(())
+        })
+    }
+}
+
 pub(crate) fn has_github_credentials(db: &mut Db) -> Result<bool> {
     Ok(github_source(db)?.is_some())
 }
@@ -372,16 +459,29 @@ pub(crate) fn disconnect_github(db: &mut Db) -> Result<()> {
             github_source(db)? != Some("environment"),
             "请从部署环境移除 GitHub 令牌"
         );
-        for key in ["github_token", "github_source"] {
+        for key in ["github_token", "github_source", GITHUB_IDENTITY_PROBE] {
             store::delete_meta(db, key)?;
         }
         Ok(())
     })
 }
-pub(crate) fn save_github_token(db: &mut Db, token: &str) -> Result<()> {
+pub(crate) fn save_github_token(
+    db: &mut Db,
+    token: &str,
+    session_revision: Option<i32>,
+) -> Result<()> {
     db.immediate_transaction(|db| {
+        if let Some(revision) = session_revision {
+            let owner = store::owner(db)?;
+            let current = account(db, &owner)?;
+            ensure!(
+                !current.disabled && current.revision == revision,
+                "设备授权无效，请重新开始"
+            );
+        }
         store::set_meta(db, "github_token", token)?;
-        store::delete_meta(db, "github_source")
+        store::delete_meta(db, "github_source")?;
+        store::delete_meta(db, GITHUB_IDENTITY_PROBE)
     })
 }
 pub(crate) fn github_token(db: &mut Db) -> Result<String> {
@@ -425,7 +525,7 @@ impl Device {
         let scope = env::var("STARSTACK_GITHUB_SCOPE").unwrap_or_default();
         Self::start_at(LOGIN, client_id, &scope, crate::proxy::builder(db)?)
     }
-    fn start_at(
+    pub(crate) fn start_at(
         endpoint: &str,
         client_id: String,
         scope: &str,
@@ -463,7 +563,7 @@ impl Device {
         let Some(token) = self.poll_token()? else {
             return Ok(false);
         };
-        save_github_token(db, &token)?;
+        save_github_token(db, &token, None)?;
         Ok(true)
     }
     pub(crate) fn poll_token(&mut self) -> Result<Option<String>> {
@@ -519,6 +619,34 @@ mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
 
     #[test]
+    fn github_identity_checks_ignore_late_responses_and_reset_on_explicit_reauthorization()
+    -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = store::connect_as(dir.path(), "reader")?;
+        save_github_token(&mut db, "original", None)?;
+        let late = GitHubIdentityProbe::start(&mut db, "original")?;
+        GitHubIdentityProbe::start(&mut db, "original")?.finish(&mut db, false)?;
+        late.finish(&mut db, true)?;
+        assert!(!github_status(&mut db)?.rejected);
+
+        GitHubIdentityProbe::start(&mut db, "original")?.finish(&mut db, true)?;
+        let old_success = GitHubIdentityProbe::start(&mut db, "original")?;
+        save_github_token(&mut db, "replacement", None)?;
+        let current = GitHubIdentityProbe::start(&mut db, "replacement")?;
+        // A task holding an old credential can begin its HTTP request after the newer one.
+        GitHubIdentityProbe::start(&mut db, "original")?.finish(&mut db, true)?;
+        current.finish(&mut db, true)?;
+        old_success.finish(&mut db, false)?;
+        assert!(github_status(&mut db)?.rejected);
+        let late_failure = GitHubIdentityProbe::start(&mut db, "replacement")?;
+        save_github_token(&mut db, "replacement", None)?;
+        late_failure.finish(&mut db, true)?;
+        assert!(!github_status(&mut db)?.rejected);
+        assert!(store::meta(&mut db, GITHUB_IDENTITY_PROBE)?.is_none());
+        Ok(())
+    }
+
+    #[test]
     fn setup_and_admin_deletion_never_reopen_registration() -> Result<()> {
         let dir = tempfile::tempdir()?;
         let mut db = store::connect(dir.path())?;
@@ -540,6 +668,24 @@ mod tests {
         assert!(!needs_setup(&mut db)?);
         assert!(verify(&mut db, "owner", "fixture-owner-password").is_err());
         assert!(verify(&mut db, "other", "fixture-other-password")?.admin);
+        Ok(())
+    }
+
+    #[test]
+    fn revoked_web_session_cannot_replace_the_github_token() -> Result<()> {
+        let dir = tempfile::tempdir()?;
+        let mut db = store::connect(dir.path())?;
+        setup(&mut db, "owner", "fixture-owner-password")?;
+        let revision = account(&mut db, PRIMARY)?.revision;
+        save_github_token(&mut db, "original-token", Some(revision))?;
+        diesel::update(accounts::table.find(PRIMARY))
+            .set(accounts::revision.eq(revision + 1))
+            .execute(&mut db)?;
+        assert!(save_github_token(&mut db, "stale-session-token", Some(revision)).is_err());
+        assert_eq!(
+            store::meta(&mut db, "github_token")?.as_deref(),
+            Some("original-token")
+        );
         Ok(())
     }
 

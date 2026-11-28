@@ -10,22 +10,49 @@ import { WaterLevel } from "./WaterLevel";
 
 interface Device { code: string; user_code: string; verification_uri: string; interval: number; expires_in: number }
 
-function DeviceAuth() {
+interface GitHubConnection {
+  source: "device" | "gh" | "environment" | null;
+  rejected: boolean;
+}
+
+function connectionText(connection?: GitHubConnection) {
+  if (!connection) return t("正在读取 GitHub 连接状态…");
+  const { source, rejected } = connection;
+  if (rejected) {
+    if (source === "environment") return t("GitHub 已拒绝部署环境中的令牌。请让管理员更新 GITHUB_TOKEN 或 GH_TOKEN，重启星栈服务后再同步。");
+    if (source === "gh") return t("GitHub 已拒绝本机 GitHub CLI 的凭证。请在运行星栈的机器上执行 gh auth login --hostname github.com，再次同步，或改用设备授权。");
+    return t("GitHub 已拒绝此账号的授权。请重新授权后再同步。");
+  }
+  if (source === "environment") return t("已通过部署环境中的 GitHub 令牌连接。");
+  if (source === "gh") return t("已通过本机 GitHub CLI 连接。");
+  if (source === "device") return t("已连接 GitHub。");
+  return t("使用浏览器连接 GitHub 账号，授权 StarStack 读取收藏。");
+}
+
+function DeviceAuth({ revision, syncWarning }: { revision: number; syncWarning?: string }) {
   const [device, setDevice] = useState<Device>();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [result, setResult] = useState("");
-  const [source, setSource] = useState<"device" | "gh" | "environment" | null>();
-  const [revision, setRevision] = useState(0);
+  const [connection, setConnection] = useState<GitHubConnection>();
+  const [statusError, setStatusError] = useState("");
+  const [reload, setReload] = useState(0);
   const [confirm, setConfirm] = useState(false);
+  const source = connection?.source;
+  const reconnectLabel = source === "gh" && connection?.rejected ? "改用设备授权" : "重新授权";
 
   useEffect(() => {
     const controller = new AbortController();
-    api<{ source: typeof source }>("github", undefined, controller.signal)
-      .then(data => { if (!controller.signal.aborted) setSource(data.source); })
-      .catch(e => { if (!controller.signal.aborted) setError(message(e)); });
+    api<GitHubConnection>("github", undefined, controller.signal)
+      .then(data => {
+        if (controller.signal.aborted) return;
+        setConnection(data);
+        setStatusError("");
+        if (data.rejected) setResult("");
+      })
+      .catch(e => { if (!controller.signal.aborted) setStatusError(message(e)); });
     return () => controller.abort();
-  }, [revision]);
+  }, [revision, reload, syncWarning]);
 
   useEffect(() => {
     if (!device) return;
@@ -40,8 +67,13 @@ function DeviceAuth() {
       try {
         const status = await api<{ status: "pending" | "complete"; interval: number }>("device/poll", { code: device.code }, controller.signal);
         if (controller.signal.aborted) return;
-        if (status.status === "complete") { setResult(t("GitHub 授权已完成。")); setSource("device"); setDevice(undefined); }
-        else timer = window.setTimeout(poll, Math.max(1, status.interval || device.interval) * 1000);
+        if (status.status === "complete") {
+          setConnection({ source: "device", rejected: false });
+          setError(""); setStatusError("");
+          setResult(t("GitHub 授权已完成。"));
+          setDevice(undefined);
+          setReload(n => n + 1);
+        } else timer = window.setTimeout(poll, Math.max(1, status.interval || device.interval) * 1000);
       } catch (e) {
         if (!controller.signal.aborted) { setError(message(e)); setDevice(undefined); }
       }
@@ -63,34 +95,35 @@ function DeviceAuth() {
     try {
       await api("device/cancel", { code });
       setResult(t("已停止等待授权。"));
-      setRevision(n => n + 1);
+      setReload(n => n + 1);
     } catch (e) { setError(message(e)); } finally { setBusy(false); }
   }
   async function disconnect() {
     setBusy(true); setError(""); setResult("");
     try {
       await api("github/disconnect", {});
-      setSource(null); setConfirm(false);
+      setConnection({ source: null, rejected: false }); setConfirm(false);
+      setReload(n => n + 1);
       setResult(t("已断开 GitHub。"));
     } catch (e) { setError(message(e)); setConfirm(false); } finally { setBusy(false); }
   }
-  return <section className="operation"><div><h2>{t("GitHub 设备授权")}</h2><p role="status">{source === "environment" ? t("已通过部署环境中的 GitHub 令牌连接。") :
-    source === "gh" ? t("已通过本机 GitHub CLI 连接。") :
-    source === "device" ? t("已连接 GitHub。") :
-    source === null ? t("使用浏览器连接 GitHub 账号，授权 StarStack 读取收藏。") : t("正在读取 GitHub 连接状态…")}</p></div>
+  return <section className="operation"><div><h2>{t("GitHub 设备授权")}</h2>{connection?.rejected
+      ? <Failure error={connectionText(connection)} />
+      : <p role="status">{connectionText(connection)}</p>}</div>
     {device ? <div className="device-code"><span>{t("设备授权码")}</span><strong>{device.user_code}</strong>
       <p>{t("在 GitHub 验证页面输入此码，完成后本页会自动更新。")}</p>
       <div className="row-controls">{/^https:\/\//i.test(device.verification_uri) && <EuiButton fill href={device.verification_uri} target="_blank" rel="noreferrer">{t("打开 GitHub 验证页")}</EuiButton>}
         <EuiButtonEmpty onClick={cancel}>{t("取消等待")}</EuiButtonEmpty></div></div>
       : source !== undefined && source !== "environment" && <div className="row-controls">
-        <EuiButton onClick={start} isLoading={busy}>{t(source ? "重新授权" : "连接 GitHub")}</EuiButton>
+        <EuiButton onClick={start} isLoading={busy}>{t(source || connection?.rejected ? reconnectLabel : "连接 GitHub")}</EuiButton>
         {source && <EuiButtonEmpty isDisabled={busy} onClick={() => setConfirm(true)}>{t("断开 GitHub")}</EuiButtonEmpty>}
       </div>}
     {confirm && <EuiConfirmModal title={t("断开 GitHub？")} onCancel={() => { if (!busy) setConfirm(false); }}
       onConfirm={disconnect} cancelButtonText={t("取消")} confirmButtonText={t("断开 GitHub")} buttonColor="danger" isLoading={busy}>
       <p>{t("本地收藏与批注会保留。重新连接后可继续同步。")}</p>
     </EuiConfirmModal>}
-    {result && <p role="status">{result}</p>}{error && <Failure error={error} retry={source === undefined ? () => { setError(""); setRevision(n => n + 1); } : undefined} />}
+    {result && <p role="status">{result}</p>}{error && <Failure error={error} />}
+    {statusError && <Failure error={statusError} retry={() => setReload(n => n + 1)} />}
   </section>;
 }
 
@@ -110,9 +143,9 @@ export type TaskStages = Partial<Record<Stage, {
   message: string; running: boolean; report?: JobReport | null; index_progress?: IndexProgress | null;
 }>>;
 
-export function Maintenance({ stats, admin, job, stages, error, initialTab, run }: {
+export function Maintenance({ stats, admin, job, stages, error, initialTab, revision, run }: {
   stats: Stats; admin: boolean; job: Job | null; stages: TaskStages; error?: { job: Job; error: string };
-  initialTab: "sync" | "index"; run: (job: Job, full: boolean, requestId?: string) => Promise<void>;
+  initialTab: "sync" | "index"; revision: number; run: (job: Job, full: boolean, requestId?: string) => Promise<void>;
 }) {
   const [active, setActive] = useState<(typeof tabs)[number][0]>(initialTab);
   const stage = active === "index" || active === "sync" ? active : active === "schedule" ? "readme" : undefined;
@@ -169,7 +202,7 @@ export function Maintenance({ stats, admin, job, stages, error, initialTab, run 
     </div>}
     {stageError && !report?.warnings.length && <Failure error={stageError} />}
     </div>
-    <div className="operations" hidden={active !== "sync"} role="tabpanel" id="maintenance-panel-sync" aria-labelledby="maintenance-tab-sync"><DeviceAuth />
+    <div className="operations" hidden={active !== "sync"} role="tabpanel" id="maintenance-panel-sync" aria-labelledby="maintenance-tab-sync"><DeviceAuth revision={revision} syncWarning={stages.sync?.report?.warnings[0]} />
       <section className="operation"><div><h2>{t("同步收藏")}</h2><p>{t("增量同步读取最近收藏。全量同步重新核对 GitHub 上的完整 Stars 列表。")}</p></div>
         <dl className="index-overview-facts sync-overview">
           <div><dt>{t("已导入收藏")}</dt><dd>{number.format(stats.total)}</dd></div>

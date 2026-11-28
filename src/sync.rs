@@ -333,7 +333,8 @@ impl Requests<'_> {
             let delay = match response {
                 Ok(r)
                     if r.status().is_success()
-                        || (path.ends_with("/readme") && r.status() == StatusCode::NOT_FOUND) =>
+                        || (path.ends_with("/readme") && r.status() == StatusCode::NOT_FOUND)
+                        || (path == "/user" && r.status() == StatusCode::UNAUTHORIZED) =>
                 {
                     return Ok(r);
                 }
@@ -497,12 +498,19 @@ fn synchronize_account(
         );
     }
     let scope_before_auth = gh.quota.clone();
-    let account = gh
-        .get("/user", progress)?
+    gh.quota.check()?;
+    let probe = crate::auth::GitHubIdentityProbe::start(conn, gh.gh.token)?;
+    let response = gh.get("/user", progress)?;
+    if response.status() == StatusCode::UNAUTHORIZED {
+        probe.finish(conn, true)?;
+        bail!("GitHub 请求 /user 返回 401 Unauthorized，请重新授权 GitHub 或检查访问令牌");
+    }
+    let account = response
         .json::<User>()
         .context("无法读取当前 GitHub 账户 ID")?
         .id
         .to_string();
+    probe.finish(conn, false)?;
     let (mut revision, cutoff, mut pending) = conn.transaction::<_, anyhow::Error, _>(|db| {
         let owner = store::meta(db, "github_account")?;
         ensure!(
